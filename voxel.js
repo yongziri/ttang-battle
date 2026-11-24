@@ -236,7 +236,8 @@
   }
 
   // ---------------------------------------------------------------- 포즈(Hero.tsx)
-  var IDLE = { armR: -1.15, armRz: -0.15, armL: -0.35, armLz: 0.2, lean: 0.05, bob: 0, headPitch: 0, legSpread: 0.12, legSwing: 0, fall: 0 };
+  // 원본 IDLE 은 오른팔이 연필 검을 앞으로 내민 자세(armR -1.15). 여기서는 깃발을 든 팔로 바꿨다(armR -0.5).
+  var IDLE = { armR: -0.5, armRz: -0.12, armL: -0.35, armLz: 0.2, lean: 0.05, bob: 0, headPitch: 0, legSpread: 0.12, legSwing: 0, fall: 0 };
   var PKEYS = Object.keys(IDLE);
   function ext(a, b) { var o = {}; PKEYS.forEach(function (k) { o[k] = (b && k in b) ? b[k] : a[k]; }); return o; }
   function mix(a, b, t) { var o = {}; PKEYS.forEach(function (k) { o[k] = a[k] + (b[k] - a[k]) * t; }); return o; }
@@ -252,11 +253,12 @@
   try { reduceMotion = root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { /* 무시 */ }
 
   /** mode 의 목표 포즈. f: 모드 시작 후 프레임(30fps), fa: 전체 프레임 */
-  function poseFor(mode, f, fa) {
+  function poseFor(mode, f, fa, flag) {
     var p;
     if (mode === 'cheer') {
       var jump = reduceMotion ? 0 : Math.abs(Math.sin((f / 15) * Math.PI)) * 0.28;
-      p = ext(IDLE, { armR: -2.9, armRz: -0.35, armL: -2.9, armLz: 0.35, lean: -0.05, bob: jump, headPitch: -0.15, legSpread: 0.18 });
+      // 깃발을 든 오른팔은 머리 위까지 다 올리지 않는다(깃대가 화면 위로 넘치지 않게)
+      p = ext(IDLE, { armR: flag ? -2.3 : -2.9, armRz: flag ? -0.2 : -0.35, armL: -2.9, armLz: 0.35, lean: -0.05, bob: jump, headPitch: -0.15, legSpread: 0.18 });
     } else if (mode === 'flinch') {
       var t = reduceMotion ? 0.75 : keys(f, [[0, 0], [3, 1], [20, 0.75]]);
       p = mix(IDLE, ext(IDLE, { armR: -1.9, armRz: -0.7, armL: -1.9, armLz: 0.7, lean: -0.4, headPitch: -0.35, bob: 0.06 }), t);
@@ -283,10 +285,38 @@
     n.head.style.transform = n.head._base + ' rotateX(' + rad(-p.headPitch) + ')';
     n.armR.style.transform = n.armR._base + ' rotateX(' + rad(-p.armR) + ') rotateZ(' + rad(-p.armRz) + ')';
     n.armL.style.transform = n.armL._base + ' rotateX(' + rad(-p.armL) + ') rotateZ(' + rad(-p.armLz) + ')';
+    if (n.flag) {
+      // 깃대는 몸통·팔 회전을 되돌려 늘 곧게 선다: (Rx(-(lean+armR)) Rz(-armRz))^-1 = Rz(armRz) Rx(lean+armR)
+      n.flag.style.transform = 'translate3d(0,60px,0) rotateZ(' + rad(p.armRz) + ') rotateX(' + rad(p.lean + p.armR) + ')';
+      n.cloth.style.transform = 'translate3d(0,-55px,0) rotateY(' + rad(c.wave || 0) + ')';
+    }
+  }
+
+  /** 깃발(깃대 + 깃발 천). 손 위치에 붙는 그룹. 천은 깃대 기준으로 펄럭인다 */
+  function flagCloth(color) {
+    return spec('flag-cloth-' + color, 16, 10, function (p) {
+      p(0, 0, color, 16, 10);
+      p(0, 0, shade(color, 1.18), 16, 1);
+      p(0, 9, shade(color, 0.7), 16, 1);
+      p(15, 0, shade(color, 0.7), 1, 10);
+      p(5, 3, '#ffffff', 5, 4);
+      p(6, 4, color, 3, 2);
+    });
+  }
+  function buildFlag(color) {
+    var fg = group(0, 0, 0);
+    var pole = '#6b4423';
+    fg.appendChild(box([0.06, 0.95, 0.06], [0, 0.25, 0], [pole, pole, pole, pole, pole, pole]));
+    fg.appendChild(box([0.11, 0.11, 0.11], [0, 0.76, 0], ['#f0c020', '#f0c020', '#f0c020', '#f0c020', '#f0c020', '#f0c020']));
+    var cloth = div('vx-g');
+    var cs = flagCloth(color);
+    cloth.appendChild(box([0.5, 0.3, 0.03], [-0.28, 0, 0], [color, color, shade(color, 1.1), shade(color, 0.8), cs, cs]));
+    fg.appendChild(cloth);
+    return { g: fg, cloth: cloth };
   }
 
   // ---------------------------------------------------------------- 캐릭터
-  var UNITS = 265; // 장면 높이(1m=100): 머리 위 만세 + 점프까지 들어가게
+  var UNITS = 285; // 장면 높이(1m=100): 머리 위 만세 + 점프 + 깃대까지 들어가게
   var live = [];
 
   function create(opts) {
@@ -316,10 +346,14 @@
     armL.appendChild(box([0.22, 0.7, 0.24], [0, -0.31, 0], armFaces));
     body.appendChild(hd.g); body.appendChild(armR); body.appendChild(armL);
     rootG.appendChild(legR); rootG.appendChild(legL); rootG.appendChild(body);
+    var hasFlag = opts.flag !== false;
+    var fl = hasFlag ? buildFlag(vest) : null;
+    if (fl) armR.appendChild(fl.g);
 
     var c = {
-      el: wrap, team: team, look: look, nodes: { root: rootG, legR: legR, legL: legL, body: body, head: hd.g, armR: armR, armL: armL },
-      front: hd.front, mode: 'idle', face: 'normal', t0: now(), snap: ext(IDLE), cur: ext(IDLE), dirty: true
+      el: wrap, team: team, look: look, flag: hasFlag,
+      nodes: { root: rootG, legR: legR, legL: legL, body: body, head: hd.g, armR: armR, armL: armL, flag: fl && fl.g, cloth: fl && fl.cloth },
+      front: hd.front, mode: 'idle', face: 'normal', t0: now(), snap: ext(IDLE), cur: ext(IDLE), dirty: true, wave: 0
     };
     c.setFace = function (kind) {
       if (c.face === kind) return c;
@@ -379,9 +413,10 @@
       if (!c.el.isConnected || c.el.offsetParent === null) continue; // 화면에 없는 캐릭터는 쉬게
       if (reduceMotion && !c.dirty) continue;
       var f = (t - c.t0) / 1000 * 30;
-      var target = poseFor(c.mode, f, fa);
+      var target = poseFor(c.mode, f, fa, c.flag);
       var w = reduceMotion ? 1 : Math.min(1, f / 6);
       c.cur = mix(c.snap, target, w);
+      c.wave = reduceMotion ? 0 : Math.sin(fa * 0.22 + c.team) * 0.35;
       applyPose(c, c.cur);
       c.dirty = false;
     }
@@ -465,7 +500,28 @@
       });
     },
     /** 아이콘 16x16 (투명 바탕) */
-    icon: function (name) { return ICONS[name] ? pixelTex('icon-' + name, 16, 16, ICONS[name]) : 'none'; }
+    icon: function (name) { return ICONS[name] ? pixelTex('icon-' + name, 16, 16, ICONS[name]) : 'none'; },
+    /** 점령 칸 깃발(조 색) 12x16 */
+    flag: function (c) {
+      return pixelTex('board-flag-' + c, 12, 16, function (p) {
+        // 같은 색 양털 위에서도 보이게: 남색 테두리 + 흰 안쪽 테두리 + 조 색 천
+        p(1, 1, '#3a2614', 2, 15); p(1, 1, '#8a5a2a', 1, 15);
+        p(0, 0, '#f0c020', 4, 2);
+        p(3, 2, '#1b1f4a', 9, 9);
+        p(3, 3, '#ffffff', 8, 7);
+        p(4, 4, c, 6, 5); p(4, 4, shade(c, 1.2), 6, 1); p(4, 8, shade(c, 0.72), 6, 1);
+        p(0, 14, '#1b1f4a', 4, 2);
+      });
+    },
+    /** 스틸권 번개(남음: 노랑 / 사용: 회색) */
+    bolt: function (on) {
+      var C = on ? '#ffe14a' : '#5a5e78', D = on ? '#c88a10' : '#3a3d52';
+      return pixelTex('bolt-' + on, 12, 16, function (p) {
+        p(5, 0, D, 6, 1); p(4, 1, C, 6, 2); p(3, 3, C, 5, 2); p(2, 5, C, 4, 2);
+        p(2, 7, C, 8, 2); p(5, 9, C, 4, 2); p(4, 11, C, 3, 2); p(3, 13, C, 2, 2); p(2, 15, D, 2, 1);
+        p(4, 1, '#ffffff', 1, 2);
+      });
+    }
   };
 
   var ICONS = {

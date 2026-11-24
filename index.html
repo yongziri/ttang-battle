@@ -15,19 +15,22 @@
 <section id="setup" class="screen">
   <header class="setup-head">
     <h1 class="logo">땅따먹기 퀴즈 배틀</h1>
-    <button type="button" id="btn-full-setup" class="btn small">전체화면 (F)</button>
+    <div class="setup-head-btns">
+      <button type="button" id="btn-music-setup" class="btn small">음악 켬</button>
+      <button type="button" id="btn-full-setup" class="btn small">전체화면 (F)</button>
+    </div>
   </header>
   <div class="setup-stage">
     <div id="setup-chars" class="setup-chars"></div>
     <div class="ground" aria-hidden="true"></div>
   </div>
   <div class="setup-grid">
-    <div class="win setup-win">
-      <div class="field">
+    <div class="win setup-win opts-win">
+      <div class="field row">
         <div class="field-label">조 수</div>
         <div id="team-count" class="segs"></div>
       </div>
-      <div class="field">
+      <div class="field row">
         <div class="field-label">보드 크기</div>
         <div id="size-opts" class="segs">
           <button type="button" class="seg" data-size="s">소 5×4</button>
@@ -35,13 +38,31 @@
           <button type="button" class="seg" data-size="l">대 8×5</button>
         </div>
       </div>
-      <div class="field">
-        <div class="field-label">제한 시간</div>
+      <div class="field row">
+        <div class="field-label">문제 시간</div>
         <div id="time-opts" class="segs">
           <button type="button" class="seg" data-time="0">없음</button>
           <button type="button" class="seg" data-time="15">15초</button>
           <button type="button" class="seg" data-time="20">20초</button>
           <button type="button" class="seg" data-time="30">30초</button>
+        </div>
+      </div>
+      <div class="field row">
+        <div class="field-label">게임 길이</div>
+        <div id="length-opts" class="segs">
+          <button type="button" class="seg" data-len="none">제한 없음</button>
+          <button type="button" class="seg" data-len="t10">10분</button>
+          <button type="button" class="seg" data-len="t15">15분</button>
+          <button type="button" class="seg" data-len="t20">20분</button>
+          <button type="button" class="seg" data-len="r3">조별 3턴</button>
+          <button type="button" class="seg" data-len="r5">조별 5턴</button>
+        </div>
+      </div>
+      <div class="field row">
+        <div class="field-label">스틸</div>
+        <div id="steal-opts" class="segs">
+          <button type="button" class="seg" data-steal="on">켜기</button>
+          <button type="button" class="seg" data-steal="off">끄기</button>
         </div>
       </div>
     </div>
@@ -62,10 +83,15 @@
 <section id="game" class="screen hidden">
   <header class="topbar">
     <div id="turn-banner" class="win turn-banner"></div>
-    <div id="empty-left" class="empty-left"></div>
+    <div class="top-info">
+      <div id="empty-left" class="empty-left"></div>
+      <div id="clock" class="clock hidden"></div>
+    </div>
+    <button type="button" id="btn-pause" class="btn small hidden">일시정지</button>
     <div class="top-btns">
       <button type="button" id="btn-undo" class="btn small">되돌리기</button>
       <button type="button" id="btn-sound" class="btn small"></button>
+      <button type="button" id="btn-music" class="btn small"></button>
       <button type="button" id="btn-full" class="btn small">전체화면</button>
       <button type="button" id="btn-setup" class="btn small">설정</button>
       <button type="button" id="btn-end" class="btn small danger">게임 종료</button>
@@ -80,8 +106,8 @@
     <aside id="scoreboard" class="win scoreboard"></aside>
   </main>
   <footer class="keyhint">
-    칸 클릭 = 도전 · <b>Space</b> 정답 보기 · <b>O</b> 정답 · <b>X</b> 오답 · <b>N</b> 문제 바꾸기 · <b>Esc</b> 닫기(차례 유지) · <b>Z</b> 되돌리기 · <b>F</b> 전체화면
-    · 점수 = 땅 칸 수 + 가장 큰 연결 땅 칸 수
+    칸 클릭 = 도전 · <b>Space</b> 정답 보기 · <b>O</b> 정답 · <b>X</b> 오답 · <b>1~6</b> 스틸 조 · <b>N</b> 문제 바꾸기 · <b>Esc</b> 닫기/스틸 없음 · <b>Z</b> 되돌리기 · <b>P</b> 일시정지 · <b>F</b> 전체화면
+    · 점수 = 땅 + 가장 큰 연결 땅
   </footer>
 </section>
 
@@ -92,13 +118,22 @@
     <div id="q-timer" class="q-timer hidden"><div id="q-timer-bar" class="q-timer-bar"></div><span id="q-timer-num" class="q-timer-num"></span></div>
     <div class="q-body">
       <div id="q-text" class="q-text"></div>
+      <div id="q-img-wrap" class="q-img-wrap hidden">
+        <img id="q-img" class="q-img" alt="문제 그림(누르면 크게 보기)">
+        <div id="q-img-err" class="img-err hidden">그림을 불러올 수 없습니다</div>
+      </div>
       <div id="answer" class="answer hidden">
         <div class="a-label">정답</div>
         <div id="a-text" class="a-text"></div>
         <div id="a-note" class="a-note hidden"></div>
       </div>
     </div>
-    <div class="q-btns">
+    <div id="steal-panel" class="steal-panel hidden">
+      <div class="steal-title">스틸 기회! 가로챌 조를 고르세요</div>
+      <div id="steal-teams" class="steal-teams"></div>
+      <button type="button" id="btn-steal-skip" class="btn">스틸 없음 <kbd>Esc</kbd></button>
+    </div>
+    <div id="q-btns" class="q-btns">
       <button type="button" id="btn-reveal" class="btn big">정답 보기 <kbd>Space</kbd></button>
       <button type="button" id="btn-correct" class="btn big ok">정답 O <kbd>O</kbd></button>
       <button type="button" id="btn-wrong" class="btn big ng">오답 X <kbd>X</kbd></button>
@@ -120,6 +155,11 @@
     <div id="res-list" class="res-list"></div>
     <p class="res-rule">점수 = 땅 칸 수 + 가장 큰 연결 땅(상하좌우) 칸 수</p>
     <div class="res-btns">
+      <button type="button" id="btn-review" class="btn hidden">틀린 문제 복습</button>
+      <span id="res-perfect" class="res-perfect hidden">전부 정답!</span>
+      <button type="button" id="btn-review-all" class="btn">전체 문제 보기</button>
+    </div>
+    <div class="res-btns">
       <button type="button" id="btn-again" class="btn primary">다시 하기</button>
       <button type="button" id="btn-res-board" class="btn">보드 보기</button>
       <button type="button" id="btn-res-undo" class="btn">되돌리기</button>
@@ -127,12 +167,46 @@
   </div>
 </div>
 
+<!-- 복습 -->
+<div id="review" class="overlay review hidden">
+  <div class="win rv-box">
+    <div class="rv-head">
+      <span id="rv-title" class="rv-title"></span>
+      <span id="rv-count" class="rv-count"></span>
+      <span id="rv-meta" class="rv-meta"></span>
+      <button type="button" id="rv-toggle" class="btn small">전체 문제 보기</button>
+      <button type="button" id="rv-close" class="btn small primary">닫기 <kbd>Esc</kbd></button>
+    </div>
+    <div class="rv-body">
+      <div id="rv-q" class="rv-q"></div>
+      <div id="rv-img-wrap" class="q-img-wrap hidden">
+        <img id="rv-img" class="q-img" alt="문제 그림(누르면 크게 보기)">
+        <div id="rv-img-err" class="img-err hidden">그림을 불러올 수 없습니다</div>
+      </div>
+      <div id="rv-answer" class="answer hidden">
+        <div class="a-label">정답</div>
+        <div id="rv-a" class="a-text"></div>
+        <div id="rv-note" class="a-note hidden"></div>
+      </div>
+    </div>
+    <div class="rv-btns">
+      <button type="button" id="rv-prev" class="btn big">◀ 이전 <kbd>←</kbd></button>
+      <button type="button" id="rv-reveal" class="btn big">정답 보기 <kbd>Space</kbd></button>
+      <button type="button" id="rv-next" class="btn big">다음 ▶ <kbd>→</kbd></button>
+    </div>
+  </div>
+</div>
+
+<!-- 그림 크게 보기 -->
+<div id="lightbox" class="lightbox hidden" title="누르면 닫힘"><img id="lightbox-img" alt="크게 본 그림"></div>
+
 <!-- 문제 편집기 -->
 <div id="editor" class="overlay editor hidden">
   <div class="win ed-box">
     <header class="ed-head">
       <h2 class="ed-title">문제 편집기</h2>
       <span id="ed-status" class="ed-status"></span>
+      <span id="ed-usage" class="ed-usage"></span>
       <span id="ed-msg" class="ed-msg" role="status"></span>
       <div class="ed-head-btns">
         <button type="button" id="ed-import" class="btn small">가져오기</button>
@@ -140,6 +214,7 @@
         <button type="button" id="ed-close" class="btn small primary">닫기</button>
       </div>
       <input type="file" id="ed-file" accept=".json,application/json" hidden>
+      <input type="file" id="ed-img-file" accept="image/*" hidden>
     </header>
     <div id="ed-warn" class="ed-warn hidden">이 브라우저에서는 저장되지 않습니다. 파일로 내보내 보관하세요</div>
     <div class="ed-main">
@@ -192,6 +267,7 @@
 <div id="toast" class="toast"></div>
 
 <script src="voxel.js"></script>
+<script src="music.js"></script>
 <script src="sets/social-5.js"></script>
 <script src="sets/social-6.js"></script>
 <script src="sets/social-7.js"></script>

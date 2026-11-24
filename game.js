@@ -116,7 +116,8 @@
         if (!q || !q.q || q.a === undefined || q.a === null || q.a === '') return;
         pool.push({
           key: set.id + '#' + i, q: String(q.q), a: String(q.a),
-          level: normLevel(q.level), note: q.note ? String(q.note) : '', setTitle: set.title || set.id
+          level: normLevel(q.level), note: q.note ? String(q.note) : '', setTitle: set.title || set.id,
+          img: sanitizeImg(q.img)
         });
       });
     });
@@ -175,6 +176,28 @@
     return out;
   }
 
+  /** 그림 주소 검증: data:image/… 또는 상대 경로만 허용, 그 외는 '' (editor.js sanitizeImg 와 같은 규칙) */
+  function sanitizeImg(v) {
+    if (typeof v !== 'string') return '';
+    var s = v.trim();
+    if (!s) return '';
+    if (/^data:image\//i.test(s)) return s;
+    // 상대 경로: 스킴(:)·절대 경로(/, \)·프로토콜 상대(//) 금지
+    if (s.indexOf(':') !== -1 || /^[\\/]/.test(s) || /[<>"'\n\r\t]/.test(s)) return '';
+    return s;
+  }
+
+  // 게임 길이: none(제한 없음) / t분(시간제) / r턴(조별 차례 수)
+  var LENGTHS = {
+    none: { kind: 'none', label: '없음' },
+    t10: { kind: 'time', min: 10, label: '10분' },
+    t15: { kind: 'time', min: 15, label: '15분' },
+    t20: { kind: 'time', min: 20, label: '20분' },
+    r3: { kind: 'turns', turns: 3, label: '조별 3턴' },
+    r5: { kind: 'turns', turns: 5, label: '조별 5턴' }
+  };
+  function fillArr(n, v) { var a = []; for (var i = 0; i < n; i++) a.push(v); return a; }
+
   /** 새 게임 상태 */
   function createGame(opts, rng) {
     rng = rng || Math.random;
@@ -182,25 +205,45 @@
     var n = size.cols * size.rows;
     var specials = placeSpecials(n, rng);
     var cells = specials.map(function (sp) { return { owner: -1, special: sp, used: false, fort: false }; });
-    return {
+    var g = {
       v: 1,
       teams: opts.teamNames.map(function (name) { return { name: name }; }),
       setIds: opts.setIds.slice(),
       sizeKey: opts.sizeKey in SIZES ? opts.sizeKey : 'm',
       cols: size.cols, rows: size.rows,
       timeLimit: opts.timeLimit || 0,
-      cells: cells, turn: 0, used: [], history: [], ended: false
+      cells: cells, turn: 0, used: [], history: [], ended: false,
+      stealOn: opts.steal !== false,
+      length: opts.length in LENGTHS ? opts.length : 'none'
     };
+    return normalizeGame(g);
+  }
+
+  /** 이전 버전 저장본이나 테스트용 상태에 새 필드를 채운다(스틸권 전원 보유, 기록 없음, 길이 제한 없음) */
+  function normalizeGame(g) {
+    var n = g.teams.length;
+    if (typeof g.stealOn !== 'boolean') g.stealOn = true;
+    if (!Array.isArray(g.steals) || g.steals.length !== n) g.steals = fillArr(n, true);
+    if (!Array.isArray(g.log)) g.log = [];
+    if (!(g.length in LENGTHS)) g.length = 'none';
+    if (!Array.isArray(g.turnsDone) || g.turnsDone.length !== n) g.turnsDone = fillArr(n, 0);
+    if (typeof g.extra !== 'boolean') g.extra = false;
+    var L = LENGTHS[g.length];
+    if (L.kind === 'time' && typeof g.timeLeftMs !== 'number') g.timeLeftMs = L.min * 60000;
+    if (typeof g.clockPaused !== 'boolean') g.clockPaused = false;
+    return g;
   }
 
   function snapshot(g) {
-    return JSON.stringify({ cells: g.cells, turn: g.turn, used: g.used, ended: g.ended });
+    return JSON.stringify({ cells: g.cells, turn: g.turn, used: g.used, ended: g.ended,
+      steals: g.steals, log: g.log, turnsDone: g.turnsDone, extra: g.extra });
   }
 
-  /** 정답 처리: 칸 점령 + 특수 칸 발동. 발동 내용을 반환 */
-  function applyCorrect(g, idx, rng) {
+  /** 정답 처리: 칸 점령 + 특수 칸 발동. 발동 내용을 반환. team 을 주면 그 조가 차지(스틸) */
+  function applyCorrect(g, idx, rng, team) {
     rng = rng || Math.random;
-    var team = g.turn, cell = g.cells[idx];
+    if (team === undefined) team = g.turn;
+    var cell = g.cells[idx];
     var ev = { idx: idx, team: team, correct: true, special: null, effectIdx: -1, extraTurn: false, prevOwner: cell.owner };
     cell.owner = team;
     if (cell.special && !cell.used) {
@@ -229,21 +272,121 @@
     return ev;
   }
 
-  /** 판정 1회: 히스토리 저장 → (정답이면) 점령 → 턴 이동. 반환 ev */
-  function judge(g, idx, correct, rng) {
+  function pushHistory(g) {
     g.history.push(snapshot(g));
     if (g.history.length > HISTORY_LIMIT) g.history.shift();
-    var ev = correct ? applyCorrect(g, idx, rng) : { idx: idx, team: g.turn, correct: false, special: null, effectIdx: -1, extraTurn: false };
-    if (!ev.extraTurn) g.turn = (g.turn + 1) % g.teams.length;
-    if (emptyCount(g.cells) === 0) g.ended = true;
+  }
+
+  /** 차례 마무리: 정규 차례면 turnsDone 에 센다("한 번 더" 추가 턴은 세지 않음). extraTurn 이면 같은 조가 한 번 더 */
+  function finishTurn(g, team, extraTurn) {
+    if (!g.extra) g.turnsDone[team] = (g.turnsDone[team] || 0) + 1;
+    if (extraTurn) { g.extra = true; g.turn = team; }
+    else { g.extra = false; g.turn = (team + 1) % g.teams.length; }
+  }
+
+  /** 출제 기록 한 줄(그림은 있고 없음만, 글자는 복습용) */
+  function logRecord(g, idx, team, result, info, stealTeam) {
+    info = info || {};
+    var r = { idx: idx, team: team, result: result, key: info.key || '', q: info.q || '', a: info.a || '', note: info.note || '', hasImg: !!info.img };
+    if (stealTeam !== undefined) r.stealTeam = stealTeam;
+    g.log.push(r);
+  }
+
+  /** 판정 1회: 히스토리 저장 → (정답이면) 점령 → 턴 이동 → 종료 판정. info: 기록용 문제 {key,q,a,note,img}. 반환 ev */
+  function judge(g, idx, correct, rng, info) {
+    normalizeGame(g);
+    pushHistory(g);
+    var team = g.turn;
+    var ev = correct ? applyCorrect(g, idx, rng) : { idx: idx, team: team, correct: false, special: null, effectIdx: -1, extraTurn: false };
+    logRecord(g, idx, team, correct ? 'correct' : 'wrong', info);
+    finishTurn(g, team, ev.extraTurn);
+    checkEnd(g);
     return ev;
   }
 
-  /** 직전 판정 취소. 되돌릴 게 없으면 false */
+  /** 지금 스틸할 수 있는 조(차례인 조 제외, 스틸권 남은 조) */
+  function stealCandidates(g) {
+    normalizeGame(g);
+    if (!g.stealOn) return [];
+    var out = [];
+    for (var t = 0; t < g.teams.length; t++) if (t !== g.turn && g.steals[t]) out.push(t);
+    return out;
+  }
+
+  /**
+   * 오답 뒤 스틸 판정 1회(원래 조 오답 + 스틸 조 판정을 한 번에 기록 → 되돌리기 1번이면 둘 다 취소).
+   * 스틸권은 결과와 무관하게 소모. 정답이면 스틸 조가 칸을 차지(특수 칸 발동). "한 번 더"는 추가 턴을 주지 않는다.
+   * 차례는 원래 조의 다음 조로.
+   */
+  function judgeSteal(g, idx, stealTeam, correct, rng, info) {
+    normalizeGame(g);
+    pushHistory(g);
+    var team = g.turn;
+    g.steals[stealTeam] = false;
+    var ev = correct ? applyCorrect(g, idx, rng, stealTeam)
+      : { idx: idx, team: stealTeam, correct: false, special: null, effectIdx: -1, extraTurn: false };
+    ev.steal = true; ev.origTeam = team; ev.team = stealTeam;
+    ev.extraTurn = false;
+    logRecord(g, idx, team, correct ? 'steal-ok' : 'steal-fail', info, stealTeam);
+    finishTurn(g, team, false);
+    checkEnd(g);
+    return ev;
+  }
+
+  /** 시간제: 남은 시간 줄이기(일시정지·종료면 그대로). 시간이 다 됐으면 true */
+  function tickClock(g, ms) {
+    normalizeGame(g);
+    if (LENGTHS[g.length].kind !== 'time' || g.clockPaused || g.ended) return isTimeUp(g);
+    g.timeLeftMs = Math.max(0, g.timeLeftMs - ms);
+    return isTimeUp(g);
+  }
+  function isTimeUp(g) { normalizeGame(g); return LENGTHS[g.length].kind === 'time' && g.timeLeftMs <= 0; }
+  /** 턴제: 모든 조가 N번의 정규 차례를 마쳤나 */
+  function turnsComplete(g) {
+    normalizeGame(g);
+    var L = LENGTHS[g.length];
+    if (L.kind !== 'turns') return false;
+    return g.turnsDone.every(function (n) { return n >= L.turns; });
+  }
+  /** 턴제 라운드 표시 {round, total} (턴제가 아니면 null) */
+  function roundInfo(g) {
+    normalizeGame(g);
+    var L = LENGTHS[g.length];
+    if (L.kind !== 'turns') return null;
+    var min = Math.min.apply(null, g.turnsDone);
+    return { round: Math.min(min + 1, L.turns), total: L.turns };
+  }
+  /** 종료 조건(빈 칸 없음 / 턴 다 씀 / 시간 끝)이면 ended. 반환 ended */
+  function checkEnd(g) {
+    if (emptyCount(g.cells) === 0 || turnsComplete(g) || isTimeUp(g)) g.ended = true;
+    return g.ended;
+  }
+
+  /** 복습할 기록: 틀린 것(오답, 스틸 실패)만 또는 전부. 같은 문제는 마지막 기록 하나만(나중에 맞혔으면 틀린 문제에서 빠짐) */
+  function reviewList(log, all) {
+    var out = [], seen = {};
+    for (var i = log.length - 1; i >= 0; i--) {
+      var r = log[i];
+      var k = r.key || ('#' + i);
+      if (seen[k]) continue;
+      seen[k] = true;
+      if (!all && r.result !== 'wrong' && r.result !== 'steal-fail') continue;
+      out.unshift(r);
+    }
+    return out;
+  }
+
+  /** 직전 판정 취소. 되돌릴 게 없으면 false (스틸권·기록·차례 수도 함께 복구) */
   function undo(g) {
     if (!g.history.length) return false;
     var s = JSON.parse(g.history.pop());
+    var n = g.teams.length;
     g.cells = s.cells; g.turn = s.turn; g.used = s.used; g.ended = s.ended;
+    g.steals = Array.isArray(s.steals) ? s.steals : fillArr(n, true);
+    g.log = Array.isArray(s.log) ? s.log : [];
+    g.turnsDone = Array.isArray(s.turnsDone) ? s.turnsDone : fillArr(n, 0);
+    g.extra = !!s.extra;
+    // 시간제에서 시간이 다 된 뒤 되돌리면 다시 끝나지 않도록 종료 상태만 다시 계산하지 않는다(교사 판단에 맡김)
     return true;
   }
 
@@ -258,7 +401,10 @@
     neighbors: neighbors, isAdjacent: isAdjacent, canSelect: canSelect, attackableCells: attackableCells,
     largestRegion: largestRegion, emptyCount: emptyCount, computeScores: computeScores, rankScores: rankScores,
     buildQuestionPool: buildQuestionPool, pickQuestion: pickQuestion, placeSpecials: placeSpecials,
-    createGame: createGame, applyCorrect: applyCorrect, judge: judge, undo: undo, isValidSave: isValidSave
+    createGame: createGame, applyCorrect: applyCorrect, judge: judge, undo: undo, isValidSave: isValidSave,
+    LENGTHS: LENGTHS, sanitizeImg: sanitizeImg, normalizeGame: normalizeGame, stealCandidates: stealCandidates,
+    judgeSteal: judgeSteal, tickClock: tickClock, isTimeUp: isTimeUp, turnsComplete: turnsComplete,
+    roundInfo: roundInfo, checkEnd: checkEnd, reviewList: reviewList, snapshot: snapshot
   };
   root.TTLogic = Logic;
   if (typeof module === 'object' && module && module.exports) module.exports = Logic;
@@ -288,10 +434,12 @@
 
   var $ = function (id) { return document.getElementById(id); };
   var g = null, pool = [];
-  var modal = null;          // { idx, kind, question, revealed, timerId, endAt, expired, lastTick }
-  var busy = false;          // 특수 칸 연출 중
-  var prefs = { sound: true };
-  var setup = { teamCount: 4, names: [], setIds: [], sizeKey: 'm', timeLimit: 0 };
+  // { idx, kind, question, revealed, timerId, endAt, expired, lastTick, phase: ask|pick|steal, stealTeam }
+  var modal = null;
+  var busy = false;          // 특수 칸·스틸 연출 중
+  var prefs = { sound: true, music: true };
+  var setup = { teamCount: 4, names: [], setIds: [], sizeKey: 'm', timeLimit: 0, steal: true, length: 'none' };
+  var review = null;         // { all, list, i, revealed }
   var setupChars = [];       // 설정 화면 캐릭터(조별 1명, 재사용)
   var heroChars = [];        // 게임 화면 보드 옆 캐릭터(조별 1명, 현재 조만 보임)
   var heroTeam = -1, heroTimer = null;
@@ -342,6 +490,16 @@
     click: function () { tone(660, 0, 0.06, 'sine', 0.08); }
   };
   function sfx(name) { try { SFX[name](); } catch (e) { /* 무시 */ } }
+
+  // ---------- 배경음악(music.js) ----------
+  function music(track) { if (root.TTMusic) root.TTMusic.play(track); }
+  function musicHurry(on) { if (root.TTMusic) root.TTMusic.setHurry(on); }
+  /** 지금 화면에 맞는 곡: 결과=fanfare, 문제 창=tense, 그 밖=calm */
+  function musicForScreen() {
+    if (!$('results').classList.contains('hidden')) music('fanfare');
+    else if (modal) music('tense');
+    else music('calm');
+  }
 
   // ---------- 공통 UI ----------
   function show(el, on) { el.classList.toggle('hidden', !on); }
@@ -467,6 +625,12 @@
     Array.prototype.forEach.call(document.querySelectorAll('#time-opts .seg'), function (b) {
       b.classList.toggle('on', Number(b.dataset.time) === setup.timeLimit);
     });
+    Array.prototype.forEach.call(document.querySelectorAll('#steal-opts .seg'), function (b) {
+      b.classList.toggle('on', (b.dataset.steal === 'on') === setup.steal);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('#length-opts .seg'), function (b) {
+      b.classList.toggle('on', b.dataset.len === setup.length);
+    });
     var total = Logic.buildQuestionPool(sets, setup.setIds).length;
     $('setup-summary').textContent = setup.setIds.length ? '선택한 문제: ' + total + '문항' : '문제 세트를 하나 이상 고르세요';
     $('btn-start').disabled = total === 0;
@@ -501,6 +665,14 @@
       var b = e.target.closest('button'); if (!b) return;
       setup.timeLimit = Number(b.dataset.time); renderSetup();
     });
+    $('steal-opts').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      setup.steal = b.dataset.steal === 'on'; renderSetup();
+    });
+    $('length-opts').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      setup.length = b.dataset.len; renderSetup();
+    });
     $('btn-start').addEventListener('click', startNewGame);
     $('btn-resume').addEventListener('click', resumeGame);
   }
@@ -513,7 +685,8 @@
     }
     pool = Logic.buildQuestionPool(allSets(), setup.setIds);
     if (!pool.length) { toast('문제 세트를 고르세요'); return; }
-    g = Logic.createGame({ teamNames: names, setIds: setup.setIds, sizeKey: setup.sizeKey, timeLimit: setup.timeLimit });
+    g = Logic.createGame({ teamNames: names, setIds: setup.setIds, sizeKey: setup.sizeKey, timeLimit: setup.timeLimit,
+      steal: setup.steal, length: setup.length });
     saveGame();
     enterGame();
   }
@@ -521,7 +694,8 @@
   function resumeGame() {
     var s = loadSave();
     if (!s) { toast('저장된 판이 없습니다'); renderSetup(); return; }
-    g = s;
+    g = Logic.normalizeGame(s); // 이전 버전 저장본: 스틸권 전원 보유, 기록 없음, 길이 제한 없음
+    if (Logic.LENGTHS[g.length].kind === 'time' && !g.ended) g.clockPaused = true; // 이어하기는 시계를 멈춘 채로
     pool = Logic.buildQuestionPool(allSets(), g.setIds);
     // 저장된 판의 세트가 편집으로 사라졌거나 비었으면 조용히 남은 세트 전체에서 출제
     if (!pool.length) pool = Logic.buildQuestionPool(allSets(), allSets().map(function (x) { return x.id; }));
@@ -537,11 +711,14 @@
     buildScoreRows();
     renderGame();
     showHero(g.turn, 'idle', 'normal');
+    clockLast = 0;
+    music('calm');
     requestAnimationFrame(function () { layoutBoard(); layoutHero(); });
   }
 
   function backToSetup() {
     closeModal();
+    closeReview();
     clearPodium();
     show($('results'), false);
     show($('game'), false);
@@ -551,9 +728,11 @@
       setup.names = g.teams.map(function (t) { return t.name; });
       setup.setIds = g.setIds.filter(function (id) { return allSets().some(function (s) { return s.id === id; }); });
       setup.sizeKey = g.sizeKey; setup.timeLimit = g.timeLimit;
+      setup.steal = g.stealOn !== false; setup.length = g.length || 'none';
     }
     renderSetupChars();
     renderSetup();
+    music('calm');
   }
 
   // ---------- 보드 옆 캐릭터 ----------
@@ -623,7 +802,10 @@
       if (fx.pop && fx.pop.indexOf(i) !== -1) cls.push('pop');
       if (fx.drop && fx.drop.indexOf(i) !== -1) cls.push('drop');
       var inner = '<span class="cell-no">' + (i + 1) + '</span>';
-      if (c.owner >= 0) inner += '<span class="cell-team">' + (c.owner + 1) + '조</span>';
+      if (c.owner >= 0) {
+        inner += '<span class="flag" style="background-image:' + V.tex.flag(TEAM_COLORS[c.owner].bg) + '"></span>' +
+          '<span class="cell-team">' + (c.owner + 1) + '조</span>';
+      }
       if (c.fort) inner += '<span class="wall" style="background-image:' + V.tex.battlement() + '"></span><span class="badge" title="요새" style="background-image:' + icon('castle') + '"></span>';
       else if (c.used && c.special) inner += '<span class="badge used" title="발동한 특수 칸" style="background-image:' + icon(SPECIAL_ICON[c.special]) + '"></span>';
       if (atk[i]) inner += '<span class="atk"></span><span class="atk-icon" style="background-image:' + icon('sword') + '"></span>';
@@ -660,6 +842,8 @@
       row.appendChild(headIcon(t, px));
       var name = document.createElement('div');
       name.className = 'score-name';
+      var steal = document.createElement('span');
+      steal.className = 'steal-ic';
       var total = document.createElement('div');
       total.className = 'score-total';
       var gauge = document.createElement('div');
@@ -668,7 +852,7 @@
       detail.className = 'score-detail';
       row.appendChild(name); row.appendChild(total); row.appendChild(gauge); row.appendChild(detail);
       sb.appendChild(row);
-      scoreRows.push({ row: row, name: name, total: total, gauge: gauge, detail: detail });
+      scoreRows.push({ row: row, name: name, steal: steal, total: total, gauge: gauge, detail: detail });
     }
   }
 
@@ -678,7 +862,16 @@
       var r = scoreRows[s.team]; if (!r) return;
       var cur = !g.ended && s.team === g.turn;
       r.row.classList.toggle('current', cur);
-      r.name.innerHTML = esc(teamName(s.team)) + (cur ? '<span class="turn-tag">◀</span>' : '');
+      r.name.textContent = teamName(s.team);
+      if (g.stealOn) {
+        // 스틸 조를 고른 순간부터 사용으로 표시(판정은 아직이어도 소모)
+        var has = g.steals[s.team] && !(modal && modal.phase === 'steal' && modal.stealTeam === s.team);
+        r.steal.style.backgroundImage = V.tex.bolt(has);
+        r.steal.title = has ? '스틸권 남음' : '스틸권 사용함';
+        r.steal.classList.toggle('used', !has);
+        r.name.insertBefore(r.steal, r.name.firstChild);
+      }
+      if (cur) r.name.insertAdjacentHTML('beforeend', '<span class="turn-tag">◀</span>');
       r.total.innerHTML = s.total + '<small>점</small>';
       var bg = TEAM_COLORS[s.team].bg, html = '';
       for (var i = 0; i < s.cells; i++) html += '<i class="' + (i < s.largest ? 'big' : '') + '" style="background:' + bg + '"></i>';
@@ -700,7 +893,56 @@
     }
     $('empty-left').textContent = '남은 빈 땅 ' + Logic.emptyCount(g.cells) + '칸';
     $('btn-undo').disabled = !g.history.length;
-    $('btn-sound').textContent = prefs.sound ? '소리 켬' : '소리 끔';
+    $('btn-sound').textContent = prefs.sound ? '효과음 켬' : '효과음 끔';
+    $('btn-music').textContent = prefs.music ? '음악 켬' : '음악 끔';
+    renderClock();
+  }
+
+  // ---------- 게임 길이(시간제·턴제) ----------
+  var clockLast = 0, clockSaveAt = 0;
+  function fmtTime(ms) {
+    var s = Math.ceil(ms / 1000), mm = Math.floor(s / 60), ss = s % 60;
+    return mm + ':' + (ss < 10 ? '0' : '') + ss;
+  }
+  function renderClock() {
+    var el = $('clock'), pb = $('btn-pause');
+    var L = g ? Logic.LENGTHS[g.length] : null;
+    if (!g || !L || L.kind === 'none') { show(el, false); show(pb, false); return; }
+    show(el, true);
+    if (L.kind === 'time') {
+      el.textContent = '남은 시간 ' + fmtTime(g.timeLeftMs) + (g.clockPaused && !g.ended ? ' (멈춤)' : '');
+      el.classList.toggle('hurry', g.timeLeftMs <= 60000 && !g.ended);
+      show(pb, !g.ended);
+      pb.textContent = g.clockPaused ? '시간 계속' : '일시정지';
+    } else {
+      var ri = Logic.roundInfo(g);
+      el.textContent = '라운드 ' + ri.round + '/' + ri.total;
+      el.classList.remove('hurry');
+      show(pb, false);
+    }
+  }
+  /** 시간제 시계: 문제 창이 떠 있어도 흐른다. 0이 되면 진행 중인 문제(스틸 포함)를 마친 뒤 끝낸다 */
+  function tickGameClock() {
+    var now = Date.now();
+    var dt = clockLast ? now - clockLast : 0;
+    clockLast = now;
+    if (!g || g.ended || $('game').classList.contains('hidden') || Logic.LENGTHS[g.length].kind !== 'time') return;
+    var up = Logic.tickClock(g, dt);
+    renderClock();
+    if (now - clockSaveAt > 5000) { clockSaveAt = now; saveGame(); }
+    if (up && !modal && !busy) {
+      Logic.checkEnd(g);
+      saveGame();
+      renderGame();
+      toast('시간이 다 되었습니다');
+      showResults(true);
+    }
+  }
+  function togglePause() {
+    if (!g || Logic.LENGTHS[g.length].kind !== 'time' || g.ended) return;
+    g.clockPaused = !g.clockPaused;
+    saveGame();
+    renderClock();
   }
 
   function renderGame(fx) {
@@ -726,11 +968,14 @@
     if (r.reset) g.used = [];
     g.used.push(r.question.key);
     stopTimer();
-    modal = { idx: idx, kind: kind, question: r.question, revealed: false, expired: false, timerId: null, endAt: 0, lastTick: -1 };
+    modal = { idx: idx, kind: kind, question: r.question, revealed: false, expired: false, timerId: null, endAt: 0, lastTick: -1,
+      phase: 'ask', stealTeam: -1 };
     showHero(g.turn, kind === 'attack' ? 'point' : 'idle', 'normal');
     renderModal();
     show($('qmodal'), true);
     sfx('click');
+    musicHurry(false);
+    music('tense');
     if (g.timeLimit > 0) startTimer(g.timeLimit);
   }
 
@@ -742,29 +987,94 @@
     return 'len-s';
   }
 
+  function span(cls, text) { var s = document.createElement('span'); s.className = cls; s.textContent = text; return s; }
+
   function renderModal() {
-    var m = modal, q = m.question, t = g.turn;
+    var m = modal, q = m.question;
+    var stealing = m.phase === 'steal';
+    var t = stealing ? m.stealTeam : g.turn;
     var target = g.cells[m.idx];
-    var kindText = m.kind === 'attack' ? '공격 — ' + esc(teamName(target.owner)) + '의 땅' : '빈 땅 차지하기';
+    var kindText = m.kind === 'attack' ? '공격 — ' + teamName(target.owner) + '의 땅' : '빈 땅 차지하기';
     var head = $('q-head');
-    head.innerHTML = '';
+    head.textContent = '';
     head.appendChild(headIcon(t, Math.round(Math.min(vh(6.5), 64))));
-    head.insertAdjacentHTML('beforeend',
-      '<span class="q-team">' + esc(teamName(t)) + '</span>' +
-      '<span class="q-target">' + (m.idx + 1) + '번 땅 · ' + kindText + '</span>' +
-      '<span class="q-level" title="난이도 ' + q.level + '">' +
-      [1, 2, 3].map(function (n) { return '<i class="' + (n <= q.level ? '' : 'off') + '" style="background-image:' + icon('star') + '"></i>'; }).join('') +
-      '</span>');
+    head.appendChild(span('q-team', teamName(t)));
+    if (stealing) head.appendChild(span('q-steal-tag', '스틸 도전'));
+    head.appendChild(span('q-target', (m.idx + 1) + '번 땅 · ' + kindText));
+    var lv = span('q-level', '');
+    lv.title = '난이도 ' + q.level;
+    lv.innerHTML = [1, 2, 3].map(function (n) { return '<i class="' + (n <= q.level ? '' : 'off') + '" style="background-image:' + icon('star') + '"></i>'; }).join('');
+    head.appendChild(lv);
     var qt = $('q-text');
     qt.textContent = q.q;
-    qt.className = 'q-text ' + fitQuestionClass(q.q);
+    qt.className = 'q-text ' + fitQuestionClass(q.q) + (q.img ? ' with-img' : '');
+    renderQuestionImage(q.img);
     $('a-text').textContent = q.a;
     $('a-note').textContent = q.note || '';
     show($('a-note'), !!q.note);
     show($('answer'), m.revealed);
     $('btn-reveal').disabled = m.revealed;
+    // 스틸 조 고르기 단계: 판정 버튼 대신 조 버튼
+    var picking = m.phase === 'pick';
+    show($('steal-panel'), picking);
+    show($('q-btns'), !picking);
+    show($('btn-change'), m.phase === 'ask');
+    $('btn-close').firstChild.textContent = m.phase === 'steal' ? '스틸 실패 ' : '닫기 ';
+    $('qbox').classList.toggle('stealing', stealing || picking);
+    if (picking) renderStealPanel();
     buildTimerBar();
     renderTimer();
+  }
+
+  /** 문제 그림: 검증된 주소만 img.src 로. 못 불러오면 안내 글 */
+  function renderQuestionImage(src) {
+    var wrap = $('q-img-wrap'), im = $('q-img'), err = $('q-img-err');
+    src = Logic.sanitizeImg(src);
+    show(wrap, !!src);
+    $('qbox').classList.toggle('has-img', !!src);
+    if (!src) { im.removeAttribute('src'); return; }
+    show(err, false); show(im, true);
+    im.onerror = function () { show(im, false); show(err, true); };
+    if (im.getAttribute('src') !== src) im.src = src;
+  }
+  function openLightbox(src) {
+    if (!src) return;
+    $('lightbox-img').src = src;
+    show($('lightbox'), true);
+  }
+  function closeLightbox() { show($('lightbox'), false); }
+  function lightboxOpen() { return !$('lightbox').classList.contains('hidden'); }
+
+  // ---------- 스틸 ----------
+  function renderStealPanel() {
+    var host = $('steal-teams');
+    host.textContent = '';
+    Logic.stealCandidates(g).forEach(function (t) {
+      var b = document.createElement('button');
+      b.type = 'button'; b.className = 'btn big steal-team'; b.dataset.t = t;
+      b.appendChild(headIcon(t, Math.round(Math.min(vh(5.5), 56))));
+      b.appendChild(span('', teamName(t)));
+      var k = document.createElement('kbd'); k.textContent = String(t + 1);
+      b.appendChild(k);
+      host.appendChild(b);
+    });
+  }
+  function pickSteal(t) {
+    if (!modal || modal.phase !== 'pick') return;
+    if (Logic.stealCandidates(g).indexOf(t) === -1) return;
+    modal.phase = 'steal';
+    modal.stealTeam = t;
+    modal.expired = false; modal.lastTick = -1;
+    sfx('click');
+    showHero(t, 'point', 'normal');
+    renderModal();
+    renderScores();
+    musicHurry(false);
+    if (g.timeLimit > 0) startTimer(g.timeLimit);
+  }
+  function skipSteal() {
+    if (!modal || modal.phase !== 'pick') return;
+    commitJudge(false, false);
   }
 
   function buildTimerBar() {
@@ -783,7 +1093,7 @@
       if (left <= 0 && !modal.expired) {
         modal.expired = true; stopTimer(); renderTimer(); sfx('timeup');
       } else if (left <= 5 && left > 0 && left !== modal.lastTick) {
-        modal.lastTick = left; sfx('tick');
+        modal.lastTick = left; sfx('tick'); musicHurry(true);
       }
     }, 200);
   }
@@ -810,47 +1120,88 @@
   }
 
   function reveal() {
-    if (!modal || modal.revealed) return;
+    if (!modal || modal.revealed || modal.phase === 'pick') return;
     modal.revealed = true;
     stopTimer();
     renderModal();
+  }
+
+  /** 문제 창 닫기(Esc). 고르기 단계면 스틸 없이 오답 확정, 스틸 판정 단계면 스틸 실패로 확정(스틸권은 이미 소모) */
+  function escModal() {
+    if (!modal) return;
+    if (modal.phase === 'pick') { skipSteal(); return; }
+    if (modal.phase === 'steal') { decide(false); return; }
+    closeModal();
   }
 
   function closeModal() {
     stopTimer();
     modal = null;
     show($('qmodal'), false);
+    closeLightbox();
+    musicHurry(false);
     if (g && heroChars.length && !busy) showHero(g.turn, 'idle', 'normal');
+    if (g && !busy) musicForScreen();
   }
 
   function changeQuestion() {
-    if (!modal) return;
+    if (!modal || modal.phase !== 'ask') return;
     openQuestion(modal.idx, modal.kind, modal.question.key);
   }
 
+  /** O/X 판정. 첫 오답이면(정답 공개 전, 스틸권 남은 조가 있으면) 스틸 고르기 단계로 넘어간다 */
   function decide(correct) {
     if (!modal || busy) return;
-    var idx = modal.idx;
+    if (modal.phase === 'pick') return;
+    if (modal.phase === 'steal') { commitJudge(correct, true); return; }
+    if (!correct && !modal.revealed && Logic.stealCandidates(g).length) {
+      stopTimer();
+      modal.phase = 'pick';
+      sfx('wrong');
+      showHero(g.turn, 'flinch', 'sweat');
+      renderModal();
+      return;
+    }
+    commitJudge(correct, false);
+  }
+
+  function questionInfo(q) { return { key: q.key, q: q.q, a: q.a, note: q.note, img: q.img }; }
+
+  /** 판정을 상태에 반영(한 번의 되돌리기 단위). steal=true 면 원래 조 오답 + 스틸 조 판정 */
+  function commitJudge(correct, steal) {
+    var m = modal, idx = m.idx, info = questionInfo(m.question);
     stopTimer();
     modal = null;
     show($('qmodal'), false);
-    var ev = Logic.judge(g, idx, correct, Math.random);
+    closeLightbox();
+    musicHurry(false);
+    var ev = steal ? Logic.judgeSteal(g, idx, m.stealTeam, correct, Math.random, info)
+      : Logic.judge(g, idx, correct, Math.random, info);
     saveGame();
     var fx = { pop: [], drop: [] };
     if (correct) fx.pop.push(idx);
     if (ev.special === 'bonus' && ev.effectIdx >= 0) fx.pop.push(ev.effectIdx);
     if (ev.special === 'quake' && ev.effectIdx >= 0) fx.drop.push(ev.effectIdx);
     renderGame(fx);
+    var queue = [];
     if (!correct) {
-      sfx('wrong'); toast('오답 — 땅은 그대로입니다');
+      sfx('wrong');
+      toast(steal ? '스틸 실패 — 땅은 그대로입니다' : '오답 — 땅은 그대로입니다');
       showHero(ev.team, 'flinch', 'sweat', 1500);
     } else {
       sfx('correct');
-      showHero(ev.team, 'cheer', ev.special ? 'shine' : 'happy', ev.special ? 2400 : 1500);
+      if (steal) queue.push({ kind: 'steal', ev: ev });
+      if (ev.special) queue.push({ kind: 'special', ev: ev });
+      showHero(ev.team, 'cheer', ev.special ? 'shine' : 'happy', 900 + queue.length * 1900);
     }
-    if (ev.special) {
+    if (queue.length) {
       busy = true;
-      setTimeout(function () { showFx(ev, function () { busy = false; afterJudge(); }); }, 450);
+      var run = function () {
+        var item = queue.shift();
+        if (!item) { busy = false; afterJudge(); return; }
+        showFx(item.ev, run, item.kind === 'steal');
+      };
+      setTimeout(run, 450);
     } else {
       afterJudge();
     }
@@ -858,16 +1209,29 @@
 
   function afterJudge() {
     if (g.ended) setTimeout(function () { showResults(true); }, 700);
+    else musicForScreen();
   }
 
   // ---------- 특수 칸 연출 ----------
-  function showFx(ev, done) {
+  function showFx(ev, done, stealFx) {
+    var fx = $('fx');
+    if (stealFx) {
+      // "○조 스틸 성공!" — 이름은 사용자 입력이라 textContent 로
+      fx.innerHTML = '<div class="win fx-card fx-steal"><div class="fx-icon"></div><div class="fx-title"></div><div class="fx-desc"></div></div>';
+      fx.querySelector('.fx-icon').style.backgroundImage = V.tex.bolt(true);
+      fx.querySelector('.fx-title').textContent = teamName(ev.team) + ' 스틸 성공!';
+      fx.querySelector('.fx-desc').textContent = (ev.idx + 1) + '번 땅을 ' + teamName(ev.team) + '가 가로챘습니다';
+      show(fx, true);
+      sfx('special');
+      setTimeout(function () { show(fx, false); done(); }, 1800);
+      return;
+    }
     var info = SPECIAL_INFO[ev.special];
     var detail = info.desc;
     if (ev.special === 'bonus') detail = ev.effectIdx >= 0 ? (ev.effectIdx + 1) + '번 땅을 덤으로 얻었습니다!' : '맞닿은 빈 땅이 없어 효과가 없습니다';
     if (ev.special === 'quake') detail = ev.effectIdx >= 0
       ? esc(teamName(ev.effectPrevOwner)) + '의 ' + (ev.effectIdx + 1) + '번 땅이 빈 땅이 되었습니다!' : '맞닿은 다른 조 땅이 없어 효과가 없습니다';
-    if (ev.special === 'again') detail = esc(teamName(ev.team)) + '가 한 번 더 합니다!';
+    if (ev.special === 'again') detail = ev.steal ? '스틸로 얻은 "한 번 더"는 추가 턴이 없습니다' : esc(teamName(ev.team)) + '가 한 번 더 합니다!';
     if (ev.special === 'fort') detail = (ev.idx + 1) + '번 땅은 이제 공격받지 않습니다';
     var fx = $('fx');
     fx.innerHTML = '<div class="win fx-card fx-' + ev.special + '"><div class="fx-icon" style="background-image:' + icon(SPECIAL_ICON[ev.special]) + '"></div>' +
@@ -898,9 +1262,68 @@
     });
     $('res-list').innerHTML = html;
     $('btn-res-undo').disabled = !g.history.length;
+    var wrong = Logic.reviewList(g.log, false).length;
+    var played = Logic.reviewList(g.log, true).length;
+    show($('btn-review'), wrong > 0);
+    $('btn-review').textContent = '틀린 문제 복습 (' + wrong + ')';
+    show($('res-perfect'), wrong === 0 && played > 0);
     show($('results'), true);
     buildPodium(ranked.slice(0, 3));
     if (withSound) sfx('fanfare');
+    music('fanfare');
+  }
+
+  // ---------- 오답 복습 ----------
+  function reviewItems(all) { return Logic.reviewList(g.log, all); }
+  function openReview(all) {
+    var list = reviewItems(!!all);
+    if (!list.length) { toast(all ? '출제 기록이 없습니다' : '틀린 문제가 없습니다'); return; }
+    review = { all: !!all, list: list, i: 0, revealed: false };
+    renderReview();
+    show($('review'), true);
+  }
+  function closeReview() { review = null; show($('review'), false); closeLightbox(); }
+  var RESULT_TEXT = { correct: '정답', wrong: '오답', 'steal-ok': '스틸 성공', 'steal-fail': '스틸 실패' };
+  function renderReview() {
+    var r = review.list[review.i];
+    $('rv-title').textContent = review.all ? '전체 문제 보기' : '틀린 문제 복습';
+    $('rv-count').textContent = (review.i + 1) + ' / ' + review.list.length;
+    $('rv-toggle').textContent = review.all ? '틀린 문제만 보기' : '전체 문제 보기';
+    var who = teamName(r.team) + (r.stealTeam !== undefined ? ' → 스틸 ' + teamName(r.stealTeam) : '');
+    $('rv-meta').textContent = who + ' · ' + (RESULT_TEXT[r.result] || '');
+    $('rv-meta').className = 'rv-meta ' + (r.result === 'wrong' || r.result === 'steal-fail' ? 'bad' : 'ok');
+    $('rv-q').textContent = r.q;
+    $('rv-q').className = 'rv-q ' + fitQuestionClass(r.q);
+    // 그림은 기록에 넣지 않고(저장 용량) 지금 문제 목록에서 key 로 찾는다
+    var pq = r.hasImg ? pool.filter(function (x) { return x.key === r.key; })[0] : null;
+    var src = pq ? Logic.sanitizeImg(pq.img) : '';
+    var im = $('rv-img');
+    show($('rv-img-wrap'), r.hasImg);
+    show($('rv-img-err'), r.hasImg && !src);
+    show(im, !!src);
+    if (src) { im.onerror = function () { show(im, false); show($('rv-img-err'), true); }; im.src = src; }
+    $('rv-a').textContent = r.a;
+    $('rv-note').textContent = r.note || '';
+    show($('rv-note'), !!r.note);
+    show($('rv-answer'), review.revealed);
+    $('rv-reveal').disabled = review.revealed;
+    $('rv-prev').disabled = review.i === 0;
+    $('rv-next').disabled = review.i === review.list.length - 1;
+  }
+  function reviewMove(d) {
+    if (!review) return;
+    var n = review.i + d;
+    if (n < 0 || n >= review.list.length) return;
+    review.i = n; review.revealed = false;
+    renderReview();
+  }
+  function reviewReveal() { if (review && !review.revealed) { review.revealed = true; renderReview(); } }
+  function reviewToggle() {
+    if (!review) return;
+    var all = !review.all, list = reviewItems(all);
+    if (!list.length) { toast('틀린 문제가 없습니다'); return; }
+    review = { all: all, list: list, i: 0, revealed: false };
+    renderReview();
   }
 
   function buildPodium(top) {
@@ -936,7 +1359,7 @@
   function endGameByTeacher() {
     if (!g || modal || busy) return;
     if (!root.confirm('게임을 끝내고 결과를 볼까요?')) return;
-    g.history.push(JSON.stringify({ cells: g.cells, turn: g.turn, used: g.used, ended: g.ended }));
+    g.history.push(Logic.snapshot(g));
     g.ended = true;
     saveGame();
     renderGame();
@@ -948,10 +1371,12 @@
     if (!g || modal || busy) return;
     if (!Logic.undo(g)) { toast('되돌릴 판정이 없습니다'); return; }
     saveGame();
+    closeReview();
     clearPodium();
     show($('results'), false);
     renderGame();
     showHero(g.turn, 'idle', 'normal');
+    music('calm');
     toast('직전 판정을 취소했습니다');
   }
 
@@ -969,6 +1394,15 @@
     if (prefs.sound) sfx('click');
   }
 
+  function toggleMusic() {
+    prefs.music = !prefs.music;
+    storageSet(PREF_KEY, prefs);
+    if (root.TTMusic) root.TTMusic.setEnabled(prefs.music);
+    if (prefs.music) musicForScreen();
+    if (g) renderTopbar();
+    $('btn-music-setup').textContent = prefs.music ? '음악 켬' : '음악 끔';
+  }
+
   function onKey(e) {
     var tag = (e.target && e.target.tagName) || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -976,15 +1410,30 @@
     if (editorOpen()) return; // 문제 편집기에서는 게임 단축키를 쓰지 않는다
     var code = e.code;
     if (code === 'KeyF') { e.preventDefault(); toggleFullscreen(); return; }
+    if (lightboxOpen()) { if (code === 'Escape' || code === 'Space') { e.preventDefault(); closeLightbox(); } return; }
     if ($('game').classList.contains('hidden')) return;
+    if (review) {
+      if (code === 'ArrowLeft') { e.preventDefault(); reviewMove(-1); }
+      else if (code === 'ArrowRight') { e.preventDefault(); reviewMove(1); }
+      else if (code === 'Space') { e.preventDefault(); reviewReveal(); }
+      else if (code === 'Escape') { e.preventDefault(); closeReview(); }
+      return;
+    }
     if (modal) {
+      var digit = /^(Digit|Numpad)([1-6])$/.exec(code);
+      if (modal.phase === 'pick') {
+        if (digit) { e.preventDefault(); pickSteal(Number(digit[2]) - 1); }
+        else if (code === 'Escape') { e.preventDefault(); skipSteal(); }
+        return;
+      }
       if (code === 'Space') { e.preventDefault(); reveal(); }
       else if (code === 'KeyO') { e.preventDefault(); decide(true); }
       else if (code === 'KeyX') { e.preventDefault(); decide(false); }
       else if (code === 'KeyN') { e.preventDefault(); changeQuestion(); }
-      else if (code === 'Escape') { e.preventDefault(); closeModal(); }
+      else if (code === 'Escape') { e.preventDefault(); escModal(); }
       return;
     }
+    if (code === 'KeyP' && Logic.LENGTHS[g.length].kind === 'time') { e.preventDefault(); togglePause(); return; }
     if (code === 'KeyZ') { e.preventDefault(); doUndo(); }
     else if (code === 'Space') { e.preventDefault(); }
   }
@@ -1002,6 +1451,10 @@
   function init() {
     var p = storageGet(PREF_KEY);
     if (p && typeof p.sound === 'boolean') prefs.sound = p.sound;
+    if (p && typeof p.music === 'boolean') prefs.music = p.music;
+    if (root.TTMusic) root.TTMusic.setEnabled(prefs.music);
+    music('calm'); // 첫 클릭·키 입력 뒤에 소리가 난다
+    $('btn-music-setup').textContent = prefs.music ? '음악 켬' : '음악 끔';
     initLook();
     var sets = allSets();
     var firstPlayable = sets.filter(function (x) { return x.questions.length > 0; })[0];
@@ -1013,6 +1466,8 @@
       setup.teamCount = s.teams.length;
       setup.names = s.teams.map(function (t) { return t.name; });
       setup.sizeKey = s.sizeKey; setup.timeLimit = s.timeLimit;
+      setup.steal = s.stealOn !== false;
+      setup.length = Logic.LENGTHS[s.length] ? s.length : 'none';
       var known = s.setIds.filter(function (id) { return sets.some(function (x) { return x.id === id; }); });
       if (known.length) setup.setIds = known;
     }
@@ -1024,7 +1479,25 @@
     $('btn-correct').addEventListener('click', function () { decide(true); });
     $('btn-wrong').addEventListener('click', function () { decide(false); });
     $('btn-change').addEventListener('click', changeQuestion);
-    $('btn-close').addEventListener('click', closeModal);
+    $('btn-close').addEventListener('click', escModal);
+    $('steal-teams').addEventListener('click', function (e) {
+      var b = e.target.closest('.steal-team'); if (b) pickSteal(Number(b.dataset.t));
+    });
+    $('btn-steal-skip').addEventListener('click', skipSteal);
+    $('q-img').addEventListener('click', function () { if (modal) openLightbox(Logic.sanitizeImg(modal.question.img)); });
+    $('rv-img').addEventListener('click', function () { openLightbox($('rv-img').getAttribute('src')); });
+    $('lightbox').addEventListener('click', closeLightbox);
+    $('btn-music').addEventListener('click', toggleMusic);
+    $('btn-music-setup').addEventListener('click', toggleMusic);
+    $('btn-pause').addEventListener('click', togglePause);
+    $('btn-review').addEventListener('click', function () { openReview(false); });
+    $('btn-review-all').addEventListener('click', function () { openReview(true); });
+    $('rv-prev').addEventListener('click', function () { reviewMove(-1); });
+    $('rv-next').addEventListener('click', function () { reviewMove(1); });
+    $('rv-reveal').addEventListener('click', reviewReveal);
+    $('rv-toggle').addEventListener('click', reviewToggle);
+    $('rv-close').addEventListener('click', closeReview);
+    setInterval(tickGameClock, 250);
     $('btn-undo').addEventListener('click', doUndo);
     $('btn-sound').addEventListener('click', toggleSound);
     $('btn-full').addEventListener('click', toggleFullscreen);
@@ -1037,7 +1510,7 @@
     });
     $('btn-again').addEventListener('click', backToSetup);
     $('btn-res-undo').addEventListener('click', doUndo);
-    $('btn-res-board').addEventListener('click', function () { clearPodium(); show($('results'), false); });
+    $('btn-res-board').addEventListener('click', function () { clearPodium(); show($('results'), false); music('calm'); });
     document.addEventListener('keydown', onKey);
     root.addEventListener('resize', onResize);
     document.addEventListener('fullscreenchange', function () { setTimeout(onResize, 60); });

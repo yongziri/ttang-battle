@@ -304,5 +304,123 @@ test('buildExport → parseImport 왕복, 파일 이름', () => {
   assert.equal(E.exportFileName('우리 반/사회:1'), '땅따먹기-우리_반_사회_1.json');
 });
 
+// ---------------------------------------------------------------- 스틸·게임 길이·기록·그림
+console.log('[스틸·게임 길이·복습·그림]');
+const INFO = (k) => ({ key: k, q: 'Q' + k, a: 'A' + k, note: '', img: '' });
+test('normalizeGame: 이전 버전 저장본은 스틸권 전원 보유·기록 없음·길이 없음', () => {
+  const g = game(['...', '...'], 3);
+  L.normalizeGame(g);
+  same(g.steals, [true, true, true]);
+  same(g.log, []);
+  assert.equal(g.length, 'none'); assert.equal(g.stealOn, true); assert.equal(g.extra, false);
+  same(g.turnsDone, [0, 0, 0]);
+  const c = L.createGame({ teamNames: ['a', 'b'], setIds: [], sizeKey: 's', steal: false, length: 't10' }, seeded(1));
+  assert.equal(c.stealOn, false); assert.equal(c.timeLeftMs, 600000);
+});
+test('stealCandidates: 차례 조 제외, 스틸권 남은 조만, 끄면 없음', () => {
+  const g = game(['...'], 4);
+  g.turn = 1;
+  same(L.stealCandidates(g), [0, 2, 3]);
+  g.steals[2] = false;
+  same(L.stealCandidates(g), [0, 3]);
+  g.stealOn = false;
+  same(L.stealCandidates(g), []);
+});
+test('judgeSteal 성공: 스틸 조가 칸 차지, 권 소모, 차례는 원래 조 다음', () => {
+  const g = game(['.1.', '...'], 3);
+  g.turn = 0;
+  const ev = L.judgeSteal(g, 1, 2, true, seeded(1), INFO('k1')); // 0조가 1조 땅 공격 → 오답 → 2조 스틸
+  assert.equal(g.cells[1].owner, 2); assert.equal(g.steals[2], false);
+  assert.equal(g.turn, 1); assert.equal(ev.team, 2); assert.equal(ev.origTeam, 0);
+  assert.equal(g.log.at(-1).result, 'steal-ok'); assert.equal(g.log.at(-1).stealTeam, 2);
+});
+test('judgeSteal 실패: 변화 없음, 권은 소모, 되돌리기로 권·기록 복구', () => {
+  const g = game(['...'], 3);
+  g.turn = 2;
+  L.judgeSteal(g, 0, 0, false, seeded(1), INFO('k2'));
+  assert.equal(g.cells[0].owner, -1); assert.equal(g.steals[0], false); assert.equal(g.turn, 0);
+  assert.equal(g.log.length, 1);
+  assert.equal(L.undo(g), true);
+  same(g.steals, [true, true, true]); same(g.log, []); assert.equal(g.turn, 2);
+});
+test('judgeSteal: 특수 칸 발동, "한 번 더"는 추가 턴 없음', () => {
+  const g = game(['...', '...'], 3);
+  g.cells[0].special = 'again';
+  g.turn = 1;
+  const ev = L.judgeSteal(g, 0, 2, true, seeded(1), INFO('k3'));
+  assert.equal(ev.special, 'again'); assert.equal(ev.extraTurn, false);
+  assert.equal(g.turn, 2); assert.equal(g.extra, false); // 원래 조(1)의 다음 조
+  g.cells[4].special = 'bonus';
+  const ev2 = L.judgeSteal(g, 4, 0, true, seeded(2), INFO('k4'));
+  assert.equal(ev2.special, 'bonus'); assert.ok(ev2.effectIdx >= 0); assert.equal(g.cells[ev2.effectIdx].owner, 0);
+});
+test('judge 기록: 정답/오답 결과와 문제 글자, 그림은 유무만', () => {
+  const g = game(['...'], 2);
+  L.judge(g, 0, true, seeded(1), { key: 'a#0', q: '문제', a: '답', note: 'n', img: 'data:image/png;base64,AAAA' });
+  L.judge(g, 1, false, seeded(1), INFO('a#1'));
+  same(g.log.map((r) => [r.key, r.team, r.result, r.hasImg]), [['a#0', 0, 'correct', true], ['a#1', 1, 'wrong', false]]);
+  assert.ok(!JSON.stringify(g.log).includes('base64'));
+});
+test('턴제: 정규 차례만 셈("한 번 더"·스틸 제외), N번씩 마치면 종료', () => {
+  const g = game(['......', '......'], 2);
+  g.length = 'r3';
+  same(plain(L.roundInfo(g)), { round: 1, total: 3 });
+  g.cells[0].special = 'again';
+  L.judge(g, 0, true, seeded(1), INFO('x')); // 0조 1턴 + 한 번 더
+  same(g.turnsDone, [1, 0]); assert.equal(g.turn, 0);
+  L.judge(g, 1, false, seeded(1), INFO('y')); // 추가 턴: 세지 않음
+  same(g.turnsDone, [1, 0]); assert.equal(g.turn, 1);
+  L.judgeSteal(g, 2, 0, false, seeded(1), INFO('z')); // 1조 차례(스틸 포함)
+  same(g.turnsDone, [1, 1]); assert.equal(g.ended, false);
+  same(plain(L.roundInfo(g)), { round: 2, total: 3 });
+  for (let i = 0; i < 4; i++) L.judge(g, 3, false, seeded(1), INFO('w' + i));
+  same(g.turnsDone, [3, 3]); assert.equal(g.ended, true); assert.equal(L.turnsComplete(g), true);
+});
+test('시간제: tickClock 은 일시정지 중 멈춤, 0이면 다음 판정에서 종료', () => {
+  const g = game(['....'], 2);
+  g.length = 't10'; L.normalizeGame(g);
+  assert.equal(g.timeLeftMs, 600000);
+  assert.equal(L.tickClock(g, 599000), false);
+  g.clockPaused = true;
+  assert.equal(L.tickClock(g, 5000), false); assert.equal(g.timeLeftMs, 1000);
+  g.clockPaused = false;
+  assert.equal(L.tickClock(g, 5000), true); assert.equal(g.timeLeftMs, 0);
+  assert.equal(g.ended, false); // 진행 중 문제를 마칠 때까지 기다림
+  L.judge(g, 0, true, seeded(1), INFO('t'));
+  assert.equal(g.ended, true);
+  const g2 = game(['..'], 2);
+  assert.equal(L.tickClock(g2, 99999), false); // 길이 제한 없음
+});
+test('reviewList: 틀린 것(오답·스틸 실패)만, 같은 문제는 마지막 기록 하나', () => {
+  const log = [
+    { key: 'a', result: 'wrong' }, { key: 'b', result: 'correct' }, { key: 'c', result: 'steal-ok' },
+    { key: 'd', result: 'steal-fail' }, { key: 'a', result: 'correct' }, { key: 'e', result: 'wrong' }
+  ];
+  same(L.reviewList(log, false).map((r) => r.key), ['d', 'e']);
+  same(L.reviewList(log, true).map((r) => r.key), ['b', 'c', 'd', 'a', 'e']);
+});
+test('sanitizeImg: data:image/ 와 상대 경로만 허용 (game.js·editor.js 같은 규칙)', () => {
+  const cases = [
+    ['data:image/png;base64,AAAA', true], ['sets/img/a.png', true], ['img/한글 그림.png', true], ['img/a\nb.png', false], ['  sets/x.jpg  ', true],
+    ['http://x/a.png', false], ['https://x/a.png', false], ['javascript:alert(1)', false], ['data:text/html,<b>', false],
+    ['/abs/a.png', false], ['//cdn/a.png', false], ['C:\\a.png', false], ['a"onerror=.png', false], [123, false], ['', false]
+  ];
+  for (const [v, ok] of cases) {
+    assert.equal(!!L.sanitizeImg(v), ok, String(v));
+    assert.equal(L.sanitizeImg(v), E.sanitizeImg(v), 'same rule: ' + v);
+  }
+});
+test('buildQuestionPool·가져오기: img 는 검증 후 유지, 나쁜 주소는 버림', () => {
+  const sets = [{ id: 's', questions: [{ q: 'Q', a: 'A', img: 'sets/img/p.png' }, { q: 'Q2', a: 'A2', img: 'javascript:x' }] }];
+  const p = L.buildQuestionPool(sets, ['s']);
+  assert.equal(p[0].img, 'sets/img/p.png'); assert.equal(p[1].img, '');
+  const r = E.parseImport(JSON.stringify({ sets: [{ title: 't', questions: [{ q: 'q', a: 'a', img: 'data:image/jpeg;base64,/9j/' }, { q: 'q', a: 'a', img: 'http://evil/x.png' }] }] }));
+  assert.equal(r.ok, true);
+  assert.equal(r.sets[0].questions[0].img, 'data:image/jpeg;base64,/9j/');
+  assert.equal('img' in r.sets[0].questions[1], false);
+  const back = E.parseImport(JSON.stringify(E.buildExport(r.sets)));
+  assert.equal(back.sets[0].questions[0].img, 'data:image/jpeg;base64,/9j/');
+});
+
 console.log(`\n결과: ${pass} 통과, ${fail} 실패`);
 process.exit(fail ? 1 : 0);

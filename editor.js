@@ -6,7 +6,7 @@
 
   var STORE_KEY = 'ttang-battle-sets-v1';
   var FORMAT = 'ttang-battle-sets';
-  var MAX_FILE = 5 * 1024 * 1024;
+  var MAX_FILE = 30 * 1024 * 1024;
 
   // ---------------------------------------------------------------- 순수 함수
   function str(v) { return v === undefined || v === null ? '' : String(v); }
@@ -16,9 +16,20 @@
     return n === 1 || n === 2 || n === 3 ? n : 2;
   }
   function isValidQuestion(q) { return !!q && str(q.q).trim() !== '' && str(q.a).trim() !== ''; }
+  /** 그림 주소 검증: data:image/… 또는 상대 경로만, 그 외(http:, javascript: 등)는 '' (game.js Logic.sanitizeImg 와 같은 규칙) */
+  function sanitizeImg(v) {
+    if (typeof v !== 'string') return '';
+    var s = v.trim();
+    if (!s) return '';
+    if (/^data:image\//i.test(s)) return s;
+    if (s.indexOf(':') !== -1 || /^[\\/]/.test(s) || /[<>"'\n\r\t]/.test(s)) return '';
+    return s;
+  }
   function cloneQ(q) {
     var o = { q: str(q.q), a: str(q.a), level: normLevel(q.level) };
     if (str(q.note) !== '') o.note = str(q.note);
+    var img = sanitizeImg(q.img);
+    if (img) o.img = img;
     return o;
   }
   function cloneSet(s) {
@@ -85,7 +96,7 @@
    * 반환 { ok: true, sets } 또는 { ok: false, error: 한 줄 설명 }
    */
   function parseImport(text) {
-    if (str(text).length > MAX_FILE) return { ok: false, error: '파일이 너무 큽니다(5MB 이하만 가져올 수 있습니다)' };
+    if (str(text).length > MAX_FILE) return { ok: false, error: '파일이 너무 큽니다(30MB 이하만 가져올 수 있습니다)' };
     var data;
     try { data = JSON.parse(str(text).replace(/^﻿/, '')); }
     catch (e) { return { ok: false, error: 'JSON 형식이 아닙니다(파일이 깨졌거나 다른 종류의 파일입니다)' }; }
@@ -203,7 +214,7 @@
 
   var EditorLogic = {
     STORE_KEY: STORE_KEY, FORMAT: FORMAT,
-    normLevel: normLevel, isValidQuestion: isValidQuestion, parsePaste: parsePaste, parseImport: parseImport,
+    normLevel: normLevel, isValidQuestion: isValidQuestion, sanitizeImg: sanitizeImg, parsePaste: parsePaste, parseImport: parseImport,
     uniqueId: uniqueId, uniqueTitle: uniqueTitle, placeSets: placeSets, normalizeStore: normalizeStore,
     mergeSets: mergeSets, playableSets: playableSets, countValid: countValid, buildExport: buildExport, exportFileName: exportFileName
   };
@@ -241,17 +252,38 @@
       canSave = false;
     }
   }
+  var WARN_BLOCKED = '이 브라우저에서는 저장되지 않습니다. 파일로 내보내 보관하세요';
+  var WARN_FULL = '저장 공간이 가득 차 저장하지 못했습니다. 그림이 많으면 [세트 내보내기]/[전체 내보내기] 파일로 보관하고 그림 일부를 지우세요';
+  var quotaHit = false;
+  function isQuotaError(e) {
+    return !!e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || e.code === 22 || e.code === 1014);
+  }
   function saveNow() {
     clearTimeout(saveTimer);
+    saveTimer = null;
+    var text = JSON.stringify(store);
     try {
-      root.localStorage.setItem(STORE_KEY, JSON.stringify(store));
-      canSave = true;
+      root.localStorage.setItem(STORE_KEY, text);
+      canSave = true; quotaHit = false;
       setStatus('저장됨', 'ok');
     } catch (e) {
-      canSave = false;
+      canSave = false; quotaHit = isQuotaError(e);
       setStatus('저장 안 됨', 'bad');
     }
+    renderWarn();
+    renderUsage(text);
+  }
+  function renderWarn() {
+    $('ed-warn').textContent = quotaHit ? WARN_FULL : WARN_BLOCKED;
     show($('ed-warn'), !canSave);
+  }
+  /** 저장 데이터 대략 크기(브라우저는 글자당 2바이트로 셈, 보통 한도 약 5MB) */
+  function renderUsage(text) {
+    if (text === undefined) text = JSON.stringify(store);
+    var mb = text.length * 2 / (1024 * 1024);
+    var el = $('ed-usage');
+    el.textContent = '저장 공간 약 ' + (mb < 0.1 ? mb.toFixed(2) : mb.toFixed(1)) + 'MB / 약 5MB';
+    el.classList.toggle('bad', mb > 4);
   }
   function scheduleSave() {
     setStatus('저장 중…', '');
@@ -353,8 +385,20 @@
       var row = el('div', 'ed-row' + (isValidQuestion(q) ? '' : ' bad'));
       row.dataset.i = i;
       var no = el('div', 'ed-no'); no.textContent = i + 1;
-      var qa = el('textarea', 'ed-in ed-q', { rows: '2', 'data-f': 'q', 'aria-label': (i + 1) + '번 문제', placeholder: '문제' });
+      var qcell = el('div', 'ed-qcell');
+      var qa = el('textarea', 'ed-in ed-q', { rows: '2', 'data-f': 'q', 'aria-label': (i + 1) + '번 문제', placeholder: '문제 (그림은 여기서 Ctrl+V 로 붙여넣기 가능)' });
       qa.value = q.q;
+      qcell.appendChild(qa);
+      if (q.img) {
+        var line = el('div', 'ed-img-line');
+        var th = el('img', 'ed-thumb', { alt: (i + 1) + '번 그림' });
+        th.src = q.img; // 검증된 data:image/ 또는 상대 경로만 들어 있음
+        th.addEventListener('error', function () { th.classList.add('broken'); th.alt = '그림을 불러올 수 없습니다'; });
+        var del = el('button', 'ed-act ed-act-wide', { type: 'button', 'data-act': 'imgdel', title: '그림 삭제' });
+        del.textContent = '그림 삭제';
+        line.appendChild(th); line.appendChild(del);
+        qcell.appendChild(line);
+      }
       var an = el('input', 'ed-in ed-a', { type: 'text', 'data-f': 'a', 'aria-label': (i + 1) + '번 정답', placeholder: '정답' });
       an.value = q.a;
       var lv = el('div', 'ed-lv');
@@ -366,13 +410,16 @@
       var note = el('input', 'ed-in ed-note', { type: 'text', 'data-f': 'note', 'aria-label': (i + 1) + '번 풀이 메모', placeholder: '(선택)' });
       note.value = q.note || '';
       var acts = el('div', 'ed-acts');
+      var ib = el('button', 'ed-act ed-act-wide', { type: 'button', 'data-act': 'img', title: '그림 파일 넣기' });
+      ib.textContent = '그림';
+      acts.appendChild(ib);
       [['up', '▲', '위로'], ['down', '▼', '아래로'], ['del', '✕', '문항 삭제']].forEach(function (a) {
         var b = el('button', 'ed-act ed-act-' + a[0], { type: 'button', 'data-act': a[0], title: a[2] });
         b.textContent = a[1];
         if ((a[0] === 'up' && i === 0) || (a[0] === 'down' && i === s.questions.length - 1)) b.disabled = true;
         acts.appendChild(b);
       });
-      row.appendChild(no); row.appendChild(qa); row.appendChild(an); row.appendChild(lv); row.appendChild(note); row.appendChild(acts);
+      row.appendChild(no); row.appendChild(qcell); row.appendChild(an); row.appendChild(lv); row.appendChild(note); row.appendChild(acts);
       host.appendChild(row);
     });
     host.parentNode.scrollTop = keep;
@@ -410,11 +457,62 @@
     var s = editable();
     if (!s) return;
     var qs = s.questions, act = b.dataset.act;
+    if (act === 'img') { imgTarget = i; $('ed-img-file').value = ''; $('ed-img-file').click(); return; }
+    if (act === 'imgdel') { delete qs[i].img; changed(true); return; }
     if (act === 'level') qs[i].level = Number(b.dataset.level);
     else if (act === 'up' && i > 0) { var t = qs[i - 1]; qs[i - 1] = qs[i]; qs[i] = t; }
     else if (act === 'down' && i < qs.length - 1) { var t2 = qs[i + 1]; qs[i + 1] = qs[i]; qs[i] = t2; }
     else if (act === 'del') qs.splice(i, 1);
     changed(true);
+  }
+
+  // ---------- 그림 넣기(파일 선택 / Ctrl+V) ----------
+  var imgTarget = -1;
+  var IMG_MAX = 1280;
+  /** 그림 파일을 긴 변 1280px 이하 JPEG(품질 0.8, 투명 부분은 흰 바탕) data URL 로 */
+  function shrinkImage(file, cb) {
+    if (!file || !/^image\//.test(file.type || '')) { message('그림 파일이 아닙니다', true); return; }
+    var url;
+    try { url = URL.createObjectURL(file); } catch (e) { message('그림을 읽지 못했습니다', true); return; }
+    var im = new Image();
+    im.onload = function () {
+      var w = im.naturalWidth || 1, h = im.naturalHeight || 1;
+      var k = Math.min(1, IMG_MAX / Math.max(w, h));
+      var cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.round(w * k)); cv.height = Math.max(1, Math.round(h * k));
+      var ctx = cv.getContext('2d');
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.drawImage(im, 0, 0, cv.width, cv.height);
+      URL.revokeObjectURL(url);
+      var data;
+      try { data = cv.toDataURL('image/jpeg', 0.8); } catch (e) { message('그림을 변환하지 못했습니다', true); return; }
+      cb(data, cv.width, cv.height);
+    };
+    im.onerror = function () { URL.revokeObjectURL(url); message('그림을 읽지 못했습니다(지원하지 않는 형식)', true); };
+    im.src = url;
+  }
+  function putImage(i, file) {
+    shrinkImage(file, function (data, w, h) {
+      var s = editable();
+      if (!s || !s.questions[i]) return;
+      s.questions[i].img = data;
+      changed(true);
+      message((i + 1) + '번 문항에 그림을 넣었습니다(' + w + '×' + h + ', 약 ' + Math.round(data.length * 0.75 / 1024) + 'KB)');
+    });
+  }
+  function onRowsPaste(e) {
+    var t = e.target;
+    if (!t.classList || !t.classList.contains('ed-q')) return;
+    var items = (e.clipboardData && e.clipboardData.items) || [];
+    for (var k = 0; k < items.length; k++) {
+      if (items[k].kind === 'file' && /^image\//.test(items[k].type)) {
+        var f = items[k].getAsFile();
+        if (!f) continue;
+        e.preventDefault();
+        putImage(Number(t.closest('.ed-row').dataset.i), f);
+        return;
+      }
+    }
   }
 
   // ---------- 세트 단위 동작 ----------
@@ -515,7 +613,7 @@
   }
   function importFile(file) {
     if (!file) return;
-    if (file.size > MAX_FILE) { message('가져오기 실패: 파일이 너무 큽니다(5MB 이하만 가져올 수 있습니다)', true); return; }
+    if (file.size > MAX_FILE) { message('가져오기 실패: 파일이 너무 큽니다(30MB 이하만 가져올 수 있습니다)', true); return; }
     var fr = new FileReader();
     fr.onload = function () { importText(String(fr.result || ''), file.name); };
     fr.onerror = function () { message('가져오기 실패: 파일을 읽지 못했습니다', true); };
@@ -536,7 +634,8 @@
     // 메모리의 store 가 기준(저장이 막힌 브라우저에서도 이번 창을 닫기 전까지는 편집 내용이 유지됨)
     var all = getAllSets();
     if (!selId || !all.some(function (s) { return s.id === selId; })) selId = all.length ? all[0].id : null;
-    show($('ed-warn'), !canSave);
+    renderWarn();
+    renderUsage();
     setStatus(canSave ? '저장됨' : '저장 안 됨', canSave ? 'ok' : 'bad');
     $('ed-msg').textContent = '';
     closePaste();
@@ -578,6 +677,11 @@
     });
     $('ed-rows').addEventListener('input', onRowsInput);
     $('ed-rows').addEventListener('click', onRowsClick);
+    $('ed-rows').addEventListener('paste', onRowsPaste);
+    $('ed-img-file').addEventListener('change', function (e) {
+      var f = e.target.files && e.target.files[0];
+      if (f && imgTarget >= 0) putImage(imgTarget, f);
+    });
     $('ed-add').addEventListener('click', addQuestion);
     $('ed-paste-open').addEventListener('click', openPaste);
     $('ed-paste-text').addEventListener('input', updatePastePreview);
