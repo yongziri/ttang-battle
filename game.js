@@ -472,7 +472,7 @@
     var o = ctx.createOscillator(), gn = ctx.createGain();
     o.type = type || 'sine'; o.frequency.setValueAtTime(freq, t0);
     gn.gain.setValueAtTime(0.0001, t0);
-    gn.gain.exponentialRampToValueAtTime(vol || 0.18, t0 + 0.02);
+    gn.gain.exponentialRampToValueAtTime((vol || 0.18) * 2, t0 + 0.02); // 전체 2배: 교실 TV에서 들리게
     gn.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
     o.connect(gn); gn.connect(ctx.destination);
     o.start(t0); o.stop(t0 + dur + 0.05);

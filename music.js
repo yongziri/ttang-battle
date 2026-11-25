@@ -75,7 +75,7 @@
     }
   };
   var STEPS = 64;
-  var MUSIC_VOL = 0.05;   // 효과음(0.1~0.2)보다 훨씬 작게
+  var MUSIC_VOL = 0.2;    // 효과음(0.2~0.4)보다 작게. 0.05는 노트북 스피커에서 거의 안 들렸다
   var FADE = 0.35;
 
   var ctx = null, master = null, enabled = true, track = null, hurry = false;
