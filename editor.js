@@ -15,7 +15,31 @@
     var n = Number(str(v).trim());
     return n === 1 || n === 2 || n === 3 ? n : 2;
   }
-  function isValidQuestion(q) { return !!q && str(q.q).trim() !== '' && str(q.a).trim() !== ''; }
+  // 보기형: game.js Logic.normalizeChoices / choiceIndex 와 같은 규칙(테스트로 둘이 같은지 확인)
+  var CIRCLED = ['①', '②', '③', '④', '⑤'];
+  function normalizeChoices(arr) {
+    if (!Array.isArray(arr)) return null;
+    var out = arr.filter(function (c) { return typeof c === 'string' || typeof c === 'number'; })
+      .map(function (c) { return String(c).trim(); }).filter(Boolean);
+    return out.length >= 2 && out.length <= 5 ? out : null;
+  }
+  function squash(s) { return String(s).replace(/\s+/g, '').toLowerCase(); }
+  function choiceIndex(choices, a) {
+    if (!Array.isArray(choices) || !choices.length) return -1;
+    var key = squash(a === undefined || a === null ? '' : a);
+    if (!key) return -1;
+    for (var i = 0; i < choices.length; i++) if (squash(choices[i]) === key) return i;
+    var ci = CIRCLED.indexOf(key);
+    if (ci !== -1 && ci < choices.length) return ci;
+    if (/^[1-5]$/.test(key) && Number(key) <= choices.length) return Number(key) - 1;
+    return -1;
+  }
+  /** 출제 가능: 문제·정답이 있고, 보기가 있으면 정답이 보기 중 하나를 가리켜야 한다 */
+  function isValidQuestion(q) {
+    if (!q || str(q.q).trim() === '' || str(q.a).trim() === '') return false;
+    var ch = normalizeChoices(q.choices);
+    return !ch || choiceIndex(ch, q.a) !== -1;
+  }
   /** 그림 주소 검증: data:image/… 또는 상대 경로만, 그 외(http:, javascript: 등)는 '' (game.js Logic.sanitizeImg 와 같은 규칙) */
   function sanitizeImg(v) {
     if (typeof v !== 'string') return '';
@@ -25,15 +49,23 @@
     if (s.indexOf(':') !== -1 || /^[\\/]/.test(s) || /[<>"'\n\r\t]/.test(s)) return '';
     return s;
   }
-  function cloneQ(q) {
+  /** 문항 복사. raw=true(편집 중 저장본)면 보기 입력칸을 빈 칸까지 그대로(최대 5) 둔다 */
+  function cloneQ(q, raw) {
     var o = { q: str(q.q), a: str(q.a), level: normLevel(q.level) };
     if (str(q.note) !== '') o.note = str(q.note);
     var img = sanitizeImg(q.img);
     if (img) o.img = img;
+    if (raw && Array.isArray(q.choices)) {
+      o.choices = q.choices.slice(0, 5).map(function (c) { return typeof c === 'string' || typeof c === 'number' ? String(c) : ''; });
+    } else {
+      var ch = normalizeChoices(q.choices);
+      if (ch) o.choices = ch;
+    }
     return o;
   }
-  function cloneSet(s) {
-    return { id: str(s.id), title: str(s.title), description: str(s.description), questions: (s.questions || []).map(cloneQ) };
+  function cloneSet(s, raw) {
+    return { id: str(s.id), title: str(s.title), description: str(s.description),
+      questions: (s.questions || []).map(function (q) { return cloneQ(q, raw); }) };
   }
 
   /** 탭 구분 텍스트(엑셀·한글 표 복사). 큰따옴표로 감싼 칸(줄바꿈 포함)도 처리 */
@@ -81,8 +113,10 @@
       var q = cs[0] || '', a = cs[1] || '';
       if (!q || !a || (q === '문제' && a === '정답')) { skipped++; return; } // 정답 없음, 머리글 줄
       var item = { q: q, a: a, level: normLevel(cs[2]) };
-      var note = cs.slice(3).filter(Boolean).join(' ');
-      if (note) item.note = note;
+      if (cs[3]) item.note = cs[3];
+      // 5번째 칸 이후: 보기1;보기2;… (칸이 여러 개면 이어 붙여 ; 로 나눔)
+      var ch = normalizeChoices(cs.slice(4).join(';').split(';'));
+      if (ch) item.choices = ch;
       items.push(item);
     });
     return { items: items, skipped: skipped };
@@ -115,7 +149,8 @@
       var qs = [];
       for (var j = 0; j < s.questions.length; j++) {
         var q = s.questions[j];
-        if (!isObj(q) || !isText(q.q) || !isText(q.a) || !isText(q.note)) {
+        if (!isObj(q) || !isText(q.q) || !isText(q.a) || !isText(q.note) ||
+          (q.choices !== undefined && q.choices !== null && !Array.isArray(q.choices))) {
           return { ok: false, error: where + ' ' + (j + 1) + '번 문항의 형식이 잘못되었습니다' };
         }
         qs.push(cloneQ(q));
@@ -161,11 +196,11 @@
     var st = emptyStore();
     if (!isObj(raw)) return st;
     if (Array.isArray(raw.user)) raw.user.forEach(function (s) {
-      if (isObj(s) && typeof s.id === 'string' && s.id && Array.isArray(s.questions)) st.user.push(cloneSet(s));
+      if (isObj(s) && typeof s.id === 'string' && s.id && Array.isArray(s.questions)) st.user.push(cloneSet(s, true));
     });
     if (isObj(raw.overrides)) Object.keys(raw.overrides).forEach(function (id) {
       var o = raw.overrides[id];
-      if (isObj(o) && Array.isArray(o.questions)) st.overrides[id] = cloneSet({ id: id, title: o.title, description: o.description, questions: o.questions });
+      if (isObj(o) && Array.isArray(o.questions)) st.overrides[id] = cloneSet({ id: id, title: o.title, description: o.description, questions: o.questions }, true);
     });
     return st;
   }
@@ -215,6 +250,7 @@
   var EditorLogic = {
     STORE_KEY: STORE_KEY, FORMAT: FORMAT,
     normLevel: normLevel, isValidQuestion: isValidQuestion, sanitizeImg: sanitizeImg, parsePaste: parsePaste, parseImport: parseImport,
+    normalizeChoices: normalizeChoices, choiceIndex: choiceIndex,
     uniqueId: uniqueId, uniqueTitle: uniqueTitle, placeSets: placeSets, normalizeStore: normalizeStore,
     mergeSets: mergeSets, playableSets: playableSets, countValid: countValid, buildExport: buildExport, exportFileName: exportFileName
   };
@@ -399,6 +435,7 @@
         line.appendChild(th); line.appendChild(del);
         qcell.appendChild(line);
       }
+      if (Array.isArray(q.choices)) qcell.appendChild(choicesBlock(q, i));
       var an = el('input', 'ed-in ed-a', { type: 'text', 'data-f': 'a', 'aria-label': (i + 1) + '번 정답', placeholder: '정답' });
       an.value = q.a;
       var lv = el('div', 'ed-lv');
@@ -413,6 +450,9 @@
       var ib = el('button', 'ed-act ed-act-wide', { type: 'button', 'data-act': 'img', title: '그림 파일 넣기' });
       ib.textContent = '그림';
       acts.appendChild(ib);
+      var cb = el('button', 'ed-act ed-act-wide' + (Array.isArray(q.choices) ? ' on' : ''), { type: 'button', 'data-act': 'choices', title: '보기형 문제로 바꾸기/되돌리기' });
+      cb.textContent = '보기';
+      acts.appendChild(cb);
       [['up', '▲', '위로'], ['down', '▼', '아래로'], ['del', '✕', '문항 삭제']].forEach(function (a) {
         var b = el('button', 'ed-act ed-act-' + a[0], { type: 'button', 'data-act': a[0], title: a[2] });
         b.textContent = a[1];
@@ -430,6 +470,33 @@
     updateCount();
   }
 
+  /** 보기 입력칸: ① 라디오(정답) + 보기 글자 + ✕, 아래 [+ 보기] */
+  function choicesBlock(q, i) {
+    var box = el('div', 'ed-choices');
+    var key = squash(q.a);
+    q.choices.forEach(function (c, ci) {
+      var line = el('label', 'ed-choice');
+      var r = el('input', '', { type: 'radio', name: 'ed-ch-' + i, 'data-ci': String(ci), title: '이 보기를 정답으로' });
+      r.checked = key !== '' && squash(c) === key;
+      var mark = el('span', 'ed-ch-no'); mark.textContent = CIRCLED[ci];
+      var inp = el('input', 'ed-in ed-ch-in', { type: 'text', 'data-f': 'choice', 'data-ci': String(ci), 'aria-label': (i + 1) + '번 보기 ' + (ci + 1), placeholder: '보기 ' + (ci + 1) });
+      inp.value = c;
+      var x = el('button', 'ed-act', { type: 'button', 'data-act': 'chdel', 'data-ci': String(ci), title: '보기 삭제' });
+      x.textContent = '✕';
+      x.disabled = q.choices.length <= 2;
+      line.appendChild(r); line.appendChild(mark); line.appendChild(inp); line.appendChild(x);
+      box.appendChild(line);
+    });
+    var add = el('button', 'ed-act ed-act-wide', { type: 'button', 'data-act': 'chadd' });
+    add.textContent = '+ 보기';
+    add.disabled = q.choices.length >= 5;
+    var help = el('span', 'ed-ch-help');
+    help.textContent = '정답 보기 왼쪽 동그라미를 누르면 정답 칸이 채워집니다';
+    var foot = el('div', 'ed-ch-foot'); foot.appendChild(add); foot.appendChild(help);
+    box.appendChild(foot);
+    return box;
+  }
+
   function changed(structural, focusIdx) {
     if (structural) { renderRows(focusIdx); }
     else updateCount();
@@ -445,12 +512,31 @@
     var i = Number(row.dataset.i);
     var s = editable();
     if (!s || !s.questions[i]) return;
-    if (f === 'note') { if (e.target.value === '') delete s.questions[i].note; else s.questions[i].note = e.target.value; }
-    else s.questions[i][f] = e.target.value;
+    var qq = s.questions[i];
+    if (f === 'note') { if (e.target.value === '') delete qq.note; else qq.note = e.target.value; }
+    else if (f === 'choice') {
+      var ci = Number(e.target.dataset.ci);
+      var wasAnswer = squash(qq.a) !== '' && squash(qq.choices[ci]) === squash(qq.a);
+      qq.choices[ci] = e.target.value;
+      if (wasAnswer) { qq.a = e.target.value; row.querySelector('[data-f="a"]').value = qq.a; }
+    }
+    else qq[f] = e.target.value;
     row.classList.toggle('bad', !isValidQuestion(s.questions[i]));
     changed(false);
   }
   function onRowsClick(e) {
+    var radio = e.target.closest('input[type="radio"][data-ci]');
+    if (radio) {
+      var ri = Number(radio.closest('.ed-row').dataset.i), rs = editable();
+      if (!rs || !rs.questions[ri]) return;
+      var rq = rs.questions[ri];
+      rq.a = String(rq.choices[Number(radio.dataset.ci)] || '');
+      var rowEl = radio.closest('.ed-row');
+      rowEl.querySelector('[data-f="a"]').value = rq.a;
+      rowEl.classList.toggle('bad', !isValidQuestion(rq));
+      changed(false);
+      return;
+    }
     var b = e.target.closest('button[data-act]');
     if (!b) return;
     var i = Number(b.closest('.ed-row').dataset.i);
@@ -459,6 +545,20 @@
     var qs = s.questions, act = b.dataset.act;
     if (act === 'img') { imgTarget = i; $('ed-img-file').value = ''; $('ed-img-file').click(); return; }
     if (act === 'imgdel') { delete qs[i].img; changed(true); return; }
+    if (act === 'choices') {
+      if (Array.isArray(qs[i].choices)) delete qs[i].choices;
+      else qs[i].choices = [str(qs[i].a), '', '', ''];
+      changed(true); return;
+    }
+    if (act === 'chadd') { if (qs[i].choices.length < 5) qs[i].choices.push(''); changed(true); return; }
+    if (act === 'chdel') {
+      var ci = Number(b.dataset.ci);
+      if (qs[i].choices.length > 2) {
+        if (squash(qs[i].choices[ci]) === squash(qs[i].a)) qs[i].a = '';
+        qs[i].choices.splice(ci, 1);
+      }
+      changed(true); return;
+    }
     if (act === 'level') qs[i].level = Number(b.dataset.level);
     else if (act === 'up' && i > 0) { var t = qs[i - 1]; qs[i - 1] = qs[i]; qs[i] = t; }
     else if (act === 'down' && i < qs.length - 1) { var t2 = qs[i + 1]; qs[i + 1] = qs[i]; qs[i] = t2; }

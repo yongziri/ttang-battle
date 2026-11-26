@@ -75,10 +75,11 @@
     }
   };
   var STEPS = 64;
-  var MUSIC_VOL = 0.2;    // 효과음(0.2~0.4)보다 작게. 0.05는 노트북 스피커에서 거의 안 들렸다
+  // 보통 단계 음량 0.2(효과음 0.2~0.4보다 작게. 0.05는 노트북 스피커에서 거의 안 들렸다). setVolume 으로 0.5/1/2배
+  var MUSIC_VOL = 0.2;
   var FADE = 0.35;
 
-  var ctx = null, master = null, enabled = true, track = null, hurry = false;
+  var ctx = null, master = null, comp = null, enabled = true, track = null, hurry = false;
   var step = 0, nextTime = 0, timer = null, scheduled = 0, unlocked = false, hidden = false;
   var log = [];
 
@@ -89,7 +90,12 @@
     try { ctx = new AC(); } catch (e) { return null; }
     master = ctx.createGain();
     master.gain.value = 0;
-    master.connect(ctx.destination);
+    // 크게(2배)에서 음이 겹쳐도 찢어지지 않게 출력 끝에 압축기
+    comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -14; comp.knee.value = 10; comp.ratio.value = 6;
+    comp.attack.value = 0.004; comp.release.value = 0.2;
+    master.connect(comp);
+    comp.connect(ctx.destination);
     return ctx;
   }
   function note(part, midi, t, stepDur, vol) {
@@ -167,6 +173,13 @@
   }
   function setHurry(on) { hurry = !!on; }
   function setEnabled(on) { enabled = !!on; apply(); }
+  /** 음량(마스터 게인 목표값). 0이면 끔 */
+  function setVolume(v) {
+    v = Math.max(0, Number(v) || 0);
+    MUSIC_VOL = v;
+    enabled = v > 0;
+    apply();
+  }
 
   // 첫 사용자 입력 뒤에만 소리를 낸다(자동재생 정책)
   function unlock() {
@@ -183,9 +196,9 @@
   });
 
   root.TTMusic = {
-    play: play, setHurry: setHurry, setEnabled: setEnabled,
+    play: play, setHurry: setHurry, setEnabled: setEnabled, setVolume: setVolume,
     state: function () {
-      return { ctx: ctx ? ctx.state : 'none', track: track, enabled: enabled, unlocked: unlocked, hidden: hidden,
+      return { ctx: ctx ? ctx.state : 'none', track: track, enabled: enabled, unlocked: unlocked, hidden: hidden, volume: MUSIC_VOL,
         looping: !!timer, hurry: hurry, scheduled: scheduled, gain: master ? +master.gain.value.toFixed(3) : 0, log: log.slice(-8) };
     }
   };

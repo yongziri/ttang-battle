@@ -188,9 +188,9 @@ test('createGame + isValidSave + JSON 왕복', () => {
 
 console.log('[문제 세트]');
 const sets = loadSets();
-test('세트 5개 로드, id 중복 없음', () => {
-  assert.equal(sets.length, 5);
-  assert.equal(new Set(sets.map((s) => s.id)).size, 5);
+test('세트 9개 로드, id 중복 없음', () => {
+  assert.equal(sets.length, 9);
+  assert.equal(new Set(sets.map((s) => s.id)).size, 9);
 });
 for (const s of sets) {
   test(`${s.id}: 형식·문항 수·level 분포`, () => {
@@ -421,6 +421,136 @@ test('buildQuestionPool·가져오기: img 는 검증 후 유지, 나쁜 주소�
   const back = E.parseImport(JSON.stringify(E.buildExport(r.sets)));
   assert.equal(back.sets[0].questions[0].img, 'data:image/jpeg;base64,/9j/');
 });
+
+// ---------------------------------------------------------------- 음량·추첨·힌트·보기·기록·캐릭터
+console.log('[음량·추첨·힌트·보기·기록·캐릭터]');
+test('음량: 단계 배수(음악 2배·효과음 1.6배), 순환, 예전 설정 변환', () => {
+  same(['off', 'low', 'mid', 'high'].map((l) => L.volumeScale('music', l)), [0, 0.5, 1, 2]);
+  same(['off', 'low', 'mid', 'high'].map((l) => L.volumeScale('sfx', l)), [0, 0.5, 1, 1.6]);
+  assert.equal(L.MUSIC_BASE * L.volumeScale('music', 'mid'), 0.2);
+  same(['off', 'low', 'mid', 'high'].map(L.nextVolume), ['low', 'mid', 'high', 'off']);
+  same(plain(L.migratePrefs({ sound: true, music: false })), { sfx: 'mid', music: 'off' });
+  same(plain(L.migratePrefs({ sound: false, music: true })), { sfx: 'off', music: 'mid' });
+  same(plain(L.migratePrefs({ sfx: 'high', music: 'low' })), { sfx: 'high', music: 'low' });
+  same(plain(L.migratePrefs(null)), { sfx: 'mid', music: 'mid' });
+});
+test('추첨 가방: 한 바퀴 동안 중복 없음, 원본 불변, 다음 바퀴 첫 번호 ≠ 직전 번호', () => {
+  const rng = seeded(11);
+  for (let n = 2; n <= 8; n++) {
+    let bag = [], last;
+    for (let round = 0; round < 20; round++) {
+      const seen = new Set();
+      for (let k = 0; k < n; k++) {
+        const before = JSON.stringify(bag);
+        const r = L.drawStudent(bag, n, rng, last);
+        assert.equal(JSON.stringify(bag), before, '원본 가방 불변');
+        assert.ok(r.num >= 1 && r.num <= n);
+        if (k === 0 && last !== undefined) assert.notEqual(r.num, last, `n=${n} 바퀴 경계 연속`);
+        assert.ok(!seen.has(r.num), `n=${n} 중복`);
+        seen.add(r.num); bag = r.bag; last = r.num;
+      }
+      assert.equal(seen.size, n);
+    }
+  }
+  same(L.drawStudent([7, 1], 4, seeded(1)).num <= 4, true); // 인원이 줄면 범위 밖 번호는 버림
+  assert.equal(L.clampDrawSize(1), 4); assert.equal(L.clampDrawSize(9), 4); assert.equal(L.clampDrawSize('6'), 6);
+});
+test('추첨 가방은 판정과 함께 저장·되돌리기', () => {
+  const g = game(['....'], 2);
+  L.normalizeGame(g);
+  g.draw.on = true;
+  const r = L.drawStudent(g.draw.bags[0], 4, seeded(3));
+  L.judge(g, 0, true, seeded(1), { key: 'a', q: 'q', a: 'a', bags: { 0: r.bag }, students: { 0: r.num } });
+  same(g.draw.bags[0], plain(r.bag)); assert.equal(g.log[0].students[0], r.num);
+  L.undo(g);
+  same(g.draw.bags[0], []);
+});
+test('힌트: 글자 수 → 초성, 공백·문장부호 유지, 괄호 병기는 (…)', () => {
+  assert.equal(L.hintText('국내 총생산(GDP)', 1), '○○ ○○○(…)');
+  assert.equal(L.hintText('국내 총생산(GDP)', 2), 'ㄱㄴ ㅊㅅㅅ(…)');
+  assert.equal(L.hintText('2·3차 산업', 1), '○·○○ ○○');
+  assert.equal(L.hintText('2·3차 산업', 2), '2·3ㅊ ㅅㅇ');
+  assert.equal(L.hintText('GDP', 1), '○○○');
+  assert.equal(L.hintText('GDP', 2), 'G○○');
+  assert.equal(L.hintText('Paris agreement', 2), 'P○○○○ a○○○○○○○○');
+  assert.equal(L.hintText('빨강, 초록, 파랑', 2), 'ㅃㄱ, ㅊㄹ, ㅍㄹ');
+  assert.equal(L.hintText('1000', 2), '1○○○');
+  assert.equal(L.hintText('쿠릴 열도(북방 4도)', 1), '○○ ○○(…)');
+});
+test('보기: 정리(2~5개), 정답 판정(공백·대소문자 무시, 번호)', () => {
+  same(L.normalizeChoices([' 가 ', '', '나']), ['가', '나']);
+  assert.equal(L.normalizeChoices(['하나']), null);
+  assert.equal(L.normalizeChoices(['1', '2', '3', '4', '5', '6']), null);
+  assert.equal(L.normalizeChoices('가;나'), null);
+  const ch = ['선진국', '개발 도상국', 'GDP', '3해리'];
+  assert.equal(L.choiceIndex(ch, '개발도상국'), 1);
+  assert.equal(L.choiceIndex(ch, 'gdp'), 2);
+  assert.equal(L.choiceIndex(ch, '③'), 2);
+  assert.equal(L.choiceIndex(ch, '4'), 3);
+  assert.equal(L.choiceIndex(ch, '5'), -1);
+  assert.equal(L.choiceIndex(ch, '없는 답'), -1);
+  assert.equal(L.choiceIndex(['3', '12'], '12'), 1); // 글자 일치가 번호보다 먼저
+  for (const [c, a] of [[ch, '개발도상국'], [ch, '②'], [['O', 'X'], 'x'], [['가'], '가']]) {
+    assert.equal(E.choiceIndex(E.normalizeChoices(c) || c, a), L.choiceIndex(L.normalizeChoices(c) || c, a), 'same rule');
+  }
+  const p = L.buildQuestionPool([{ id: 's', questions: [{ q: 'Q', a: '나', choices: ['가', '나'] }, { q: 'Q2', a: 'b', choices: ['b'] }] }], ['s']);
+  same(p[0].choices, ['가', '나']); assert.equal(p[1].choices, null);
+});
+test('편집기: 보기 검증(정답이 보기를 가리켜야 출제), 붙여넣기 5번째 칸, 가져오기', () => {
+  assert.equal(E.isValidQuestion({ q: 'Q', a: '나', choices: ['가', '나'] }), true);
+  assert.equal(E.isValidQuestion({ q: 'Q', a: '다', choices: ['가', '나'] }), false);
+  assert.equal(E.isValidQuestion({ q: 'Q', a: '다', choices: ['가', ''] }), true); // 보기 1개면 일반 문항
+  const r = E.parsePaste('수도는?\t서울\t1\t\t부산;서울;대구\n환율?|비율|2|메모|가;나|다\n보기 하나|답|1||하나');
+  same(r.items, [
+    { q: '수도는?', a: '서울', level: 1, choices: ['부산', '서울', '대구'] },
+    { q: '환율?', a: '비율', level: 2, note: '메모', choices: ['가', '나', '다'] },
+    { q: '보기 하나', a: '답', level: 1 }
+  ]);
+  const imp = E.parseImport(JSON.stringify({ sets: [{ title: 't', questions: [{ q: 'q', a: '나', choices: ['가', '나', ''] }, { q: 'q', a: 'a', choices: ['x'] }] }] }));
+  same(imp.sets[0].questions, [{ q: 'q', a: '나', level: 2, choices: ['가', '나'] }, { q: 'q', a: 'a', level: 2 }]);
+  assert.equal(E.parseImport(JSON.stringify({ questions: [{ q: 'q', a: 'a', choices: '가;나' }] })).ok, false);
+  const st = E.normalizeStore({ v: 1, user: [{ id: 'u', title: 'U', questions: [{ q: 'q', a: '', choices: ['', '나', ''] }] }], overrides: {} });
+  same(st.user[0].questions[0].choices, ['', '나', '']); // 편집 중인 빈 보기 칸은 저장본에서 유지
+});
+test('기록: 생성(정답률·순위), 같은 판 갱신, 100판 제한, CSV(BOM·따옴표)', () => {
+  const g = game(['01..'], 2);
+  L.normalizeGame(g);
+  g.gameId = 'G1'; g.className = '3-2';
+  g.log = [{ result: 'correct' }, { result: 'wrong' }, { result: 'steal-ok' }, { result: 'steal-fail' }];
+  const rec = L.buildRecord(g, ['사회 "Ⅴ"', '레크'], new Date('2026-11-25T03:04:00Z'));
+  assert.equal(rec.correctRate, 50); assert.equal(rec.questions, 4); assert.equal(rec.className, '3-2');
+  same(rec.teams.map((t) => [t.name, t.rank, t.score, t.cells]), [['1조', 1, 2, 1], ['2조', 1, 2, 1]]);
+  let list = L.upsertRecord([], rec);
+  list = L.upsertRecord(list, { ...rec, correctRate: 75 });
+  assert.equal(list.length, 1); assert.equal(list[0].correctRate, 75);
+  for (let i = 0; i < 120; i++) list = L.upsertRecord(list, { ...rec, id: 'x' + i });
+  assert.equal(list.length, 100); assert.equal(list[0].id, 'x119');
+  const csv = L.recordsToCSV([rec]);
+  assert.ok(csv.startsWith('﻿날짜,반,세트,'));
+  assert.ok(csv.includes('"사회 ""Ⅴ"" / 레크"'));
+  assert.equal(csv.trim().split('\r\n').length, 3);
+});
+test('캐릭터 모양: 기본은 조 순서, 8종 범위 밖 값은 기본으로, 이전 저장본 호환', () => {
+  const g = game(['..'], 3);
+  L.normalizeGame(g);
+  same(g.looks, [0, 1, 2]);
+  const c = L.createGame({ teamNames: ['a', 'b', 'c'], setIds: [], sizeKey: 's', looks: [7, 99, -1] }, seeded(1));
+  same(c.looks, [7, 1, 2]);
+  assert.equal(L.LOOK_COUNT, 8);
+  same(c.draw.sizes, [4, 4, 4]); assert.equal(c.draw.on, false); assert.equal(c.hintOn, true);
+  assert.ok(typeof c.gameId === 'string' && c.gameId.length > 3);
+});
+for (const s of sets) {
+  test(`${s.id}: 보기가 있는 문항은 정답이 보기 중 하나`, () => {
+    s.questions.forEach((q, i) => {
+      if (q.choices === undefined) return;
+      const ch = L.normalizeChoices(q.choices);
+      assert.ok(ch && ch.length === q.choices.length, `#${i} 보기 형식`);
+      assert.notEqual(L.choiceIndex(ch, q.a), -1, `#${i} 정답 "${q.a}"가 보기에 없음`);
+    });
+    if (/^social-(9|10|11|12)$/.test(s.id)) assert.ok(s.questions.filter((q) => q.choices).length >= 5, '보기형 5개 이상');
+  });
+}
 
 console.log(`\n결과: ${pass} 통과, ${fail} 실패`);
 process.exit(fail ? 1 : 0);

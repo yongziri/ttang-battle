@@ -62,7 +62,10 @@
     { style: 'cap', hair: '#2a2420', hairD: '#16120f', cap: '#f0f0ea', brim: '#c03a30' },
     { style: 'long', hair: '#24202a', hairD: '#141018', ribbon: '#ff5a8a' },
     { style: 'spiky', hair: '#22222e', hairD: '#101018' },
-    { style: 'buns', hair: '#7a4a2a', hairD: '#5a3418' }
+    { style: 'buns', hair: '#7a4a2a', hairD: '#5a3418' },
+    // 추가 2종(캐릭터 고르기용): 높이 묶은 포니테일 + 노란 머리끈 / 남보라 비니 + 방울
+    { style: 'ponytail', hair: '#8a3a22', hairD: '#5e2414', tie: '#ffd23f' },
+    { style: 'beanie', hair: '#3a2a1c', hairD: '#22180e', hat: '#4a4f9a', band: '#2f3370', pom: '#f4f4f0' }
   ];
   var DEFAULT_VEST = ['#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#F0E442'];
 
@@ -83,6 +86,13 @@
       } else if (L.style === 'buns') {
         p(0, 0, H, 16, 4); p(0, 4, H, 2, 6); p(14, 4, H, 2, 6); p(2, 4, H, 4, 1); p(10, 4, H, 4, 1);
         p(7, 0, HD, 2, 4); p(0, 0, HD, 16, 1);
+      } else if (L.style === 'ponytail') {
+        // 한쪽으로 넘긴 앞머리
+        p(0, 0, H, 16, 4); p(0, 4, H, 2, 5); p(14, 4, H, 2, 7); p(5, 4, H, 9, 1); p(9, 5, H, 5, 1); p(12, 6, H, 2, 1);
+        p(0, 0, HD, 16, 1);
+      } else if (L.style === 'beanie') {
+        // 비니가 이마까지 덮는다(위 4줄은 모자 상자에 가려짐)
+        p(0, 0, H, 16, 5); p(0, 5, H, 1, 4); p(15, 5, H, 1, 4); p(3, 5, H, 3, 1); p(10, 5, H, 3, 1);
       } else {
         // cowlick, cap: 원본 주인공(heroFace) 앞머리
         p(0, 0, H, 16, 4); p(0, 4, H, 2, 6); p(14, 4, H, 2, 6); p(2, 4, H, 5, 1); p(9, 4, H, 3, 1);
@@ -232,6 +242,16 @@
     else if (L.style === 'long') { add([0.52, 0.62, 0.1], [0, 0.18, -0.22], hair); add([0.18, 0.1, 0.1], [0.16, 0.5, 0.06], L.ribbon); }
     else if (L.style === 'spiky') { add([0.14, 0.14, 0.14], [-0.15, 0.55, 0.02], hair); add([0.14, 0.18, 0.14], [0.02, 0.57, -0.04], hair); add([0.14, 0.14, 0.14], [0.17, 0.54, 0.06], hair); }
     else if (L.style === 'buns') { add([0.17, 0.17, 0.17], [-0.21, 0.52, -0.08], hair); add([0.17, 0.17, 0.17], [0.21, 0.52, -0.08], hair); }
+    else if (L.style === 'ponytail') {
+      // 카메라에 보이는 쪽(+x)으로 높이 묶은 옆 포니테일
+      add([0.1, 0.12, 0.12], [0.29, 0.4, -0.08], L.tie);        // 머리끈
+      add([0.14, 0.4, 0.15], [0.36, 0.17, -0.1], hair);         // 늘어진 꼬리
+      add([0.12, 0.1, 0.13], [0.37, -0.06, -0.1], L.hairD);     // 꼬리 끝
+    } else if (L.style === 'beanie') {
+      add([0.56, 0.22, 0.56], [0, 0.43, 0], L.hat);           // 몸통
+      add([0.58, 0.08, 0.58], [0, 0.32, 0], L.band);          // 접은 단
+      add([0.14, 0.12, 0.14], [0, 0.6, 0], L.pom);            // 방울
+    }
     return { g: head, front: hb._faces.pz };
   }
 
@@ -382,8 +402,8 @@
   }
 
   /** 점수판·문제 창용 머리 블록 아이콘(움직이지 않음) */
-  function headIcon(team, outfit, px, face) {
-    var look = team % LOOKS.length;
+  function headIcon(team, outfit, px, face, lookIdx) {
+    var look = typeof lookIdx === 'number' ? lookIdx % LOOKS.length : team % LOOKS.length;
     var wrap = div('vx vx-icon');
     px = px || 40;
     wrap.style.width = px + 'px'; wrap.style.height = px + 'px';
@@ -566,6 +586,15 @@
       var Y = '#ffe14a', D = '#c89a1a';
       p(7, 1, Y, 2, 4); p(1, 5, Y, 14, 3); p(3, 8, Y, 10, 2); p(4, 10, Y, 3, 3); p(9, 10, Y, 3, 3); p(3, 13, Y, 2, 2); p(11, 13, Y, 2, 2);
       p(1, 7, D, 2, 1); p(13, 7, D, 2, 1);
+    },
+    speaker: function (p) {
+      var W = '#ffffff', D = '#9aa0c0';
+      p(1, 6, W, 3, 4); p(4, 5, W, 1, 6); p(5, 4, W, 1, 8); p(6, 3, W, 1, 10); p(7, 2, W, 1, 12);
+      p(1, 9, D, 3, 1); p(9, 5, D, 1, 1); p(10, 6, D, 1, 4); p(9, 10, D, 1, 1);
+    },
+    note: function (p) {
+      var W = '#ffffff';
+      p(5, 2, W, 9, 2); p(5, 4, W, 2, 8); p(12, 4, W, 2, 6); p(2, 11, W, 5, 3); p(3, 10, W, 3, 1); p(9, 9, W, 5, 3); p(10, 8, W, 3, 1);
     },
     trophy: function (p) {
       var Y = '#ffe14a', D = '#c89a1a';

@@ -117,7 +117,7 @@
         pool.push({
           key: set.id + '#' + i, q: String(q.q), a: String(q.a),
           level: normLevel(q.level), note: q.note ? String(q.note) : '', setTitle: set.title || set.id,
-          img: sanitizeImg(q.img)
+          img: sanitizeImg(q.img), choices: normalizeChoices(q.choices)
         });
       });
     });
@@ -214,7 +214,12 @@
       timeLimit: opts.timeLimit || 0,
       cells: cells, turn: 0, used: [], history: [], ended: false,
       stealOn: opts.steal !== false,
-      length: opts.length in LENGTHS ? opts.length : 'none'
+      length: opts.length in LENGTHS ? opts.length : 'none',
+      gameId: opts.gameId || ('g' + Date.now().toString(36) + Math.floor(rng() * 1e9).toString(36)),
+      className: typeof opts.className === 'string' ? opts.className.trim().slice(0, 20) : '',
+      hintOn: opts.hint !== false,
+      looks: Array.isArray(opts.looks) ? opts.looks.slice(0, opts.teamNames.length) : null,
+      draw: { on: !!opts.draw, sizes: Array.isArray(opts.drawSizes) ? opts.drawSizes.slice() : null, bags: null }
     };
     return normalizeGame(g);
   }
@@ -231,12 +236,168 @@
     var L = LENGTHS[g.length];
     if (L.kind === 'time' && typeof g.timeLeftMs !== 'number') g.timeLeftMs = L.min * 60000;
     if (typeof g.clockPaused !== 'boolean') g.clockPaused = false;
+    // 이후 버전 필드: 판 id(기록용), 반 이름, 힌트, 캐릭터 모양, 답할 학생 추첨
+    if (typeof g.gameId !== 'string' || !g.gameId) g.gameId = 'g' + Date.now().toString(36);
+    if (typeof g.className !== 'string') g.className = '';
+    if (typeof g.hintOn !== 'boolean') g.hintOn = true;
+    if (!Array.isArray(g.looks) || g.looks.length !== n) {
+      var looks = [];
+      for (var t = 0; t < n; t++) looks.push(Array.isArray(g.looks) && typeof g.looks[t] === 'number' ? g.looks[t] : t % LOOK_COUNT);
+      g.looks = looks;
+    }
+    g.looks = g.looks.map(function (v, i) { v = Math.floor(Number(v)); return v >= 0 && v < LOOK_COUNT ? v : i % LOOK_COUNT; });
+    if (!g.draw || typeof g.draw !== 'object') g.draw = { on: false };
+    g.draw.on = !!g.draw.on;
+    if (!Array.isArray(g.draw.sizes) || g.draw.sizes.length !== n) g.draw.sizes = fillArr(n, DRAW_DEFAULT);
+    g.draw.sizes = g.draw.sizes.map(clampDrawSize);
+    if (!Array.isArray(g.draw.bags) || g.draw.bags.length !== n) g.draw.bags = fillArr(n, null).map(function () { return []; });
     return g;
   }
 
   function snapshot(g) {
     return JSON.stringify({ cells: g.cells, turn: g.turn, used: g.used, ended: g.ended,
-      steals: g.steals, log: g.log, turnsDone: g.turnsDone, extra: g.extra });
+      steals: g.steals, log: g.log, turnsDone: g.turnsDone, extra: g.extra, bags: g.draw ? g.draw.bags : null });
+  }
+
+  // ---------- 답할 학생 추첨(조별 셔플 가방) ----------
+  var DRAW_DEFAULT = 4, DRAW_MIN = 2, DRAW_MAX = 8, LOOK_COUNT = 8;
+  function clampDrawSize(v) { v = Math.round(Number(v)); return v >= DRAW_MIN && v <= DRAW_MAX ? v : DRAW_DEFAULT; }
+  /**
+   * 가방에서 번호 하나 뽑기(원본 가방은 바꾸지 않음). 가방이 비었거나 인원이 바뀌었으면 1~n 을 새로 섞어 채운다.
+   * 새로 채울 때 직전 번호(last)가 맨 처음에 오지 않게 한다. 반환 { num, bag(남은 번호) }
+   */
+  function drawStudent(bag, n, rng, last) {
+    rng = rng || Math.random;
+    n = clampDrawSize(n);
+    var b = (bag || []).filter(function (x) { return x >= 1 && x <= n; });
+    if (!b.length) {
+      b = shuffle(Array.from({ length: n }, function (_, i) { return i + 1; }), rng);
+      if (n > 1 && b[b.length - 1] === last) { var t = b[0]; b[0] = b[b.length - 1]; b[b.length - 1] = t; }
+    }
+    var num = b[b.length - 1];
+    return { num: num, bag: b.slice(0, -1) };
+  }
+  /** 판정 때 미리 뽑아 둔 추첨 결과(가방)를 상태에 반영 — 판정과 함께 되돌리기 대상이 된다 */
+  function applyDraws(g, info) {
+    if (!info || !info.bags) return;
+    Object.keys(info.bags).forEach(function (t) {
+      if (g.draw.bags[t] !== undefined) g.draw.bags[t] = info.bags[t].slice();
+    });
+  }
+
+  // ---------- 힌트 ----------
+  var CHO = ['ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'];
+  /**
+   * 정답 힌트. stage 1: 글자 수(○), stage 2: 초성(한글) / 첫 글자(영문·숫자 덩어리).
+   * 공백·문장부호는 그대로, 괄호 안 병기는 "(…)" 로 감춘다.
+   */
+  function hintText(answer, stage) {
+    var s = String(answer === undefined || answer === null ? '' : answer).trim();
+    var parts = s.split(/(\([^)]*\)|（[^）]*）)/);
+    return parts.map(function (part) {
+      if (/^[(（]/.test(part)) return '(…)';
+      var out = '', runStart = true;
+      for (var i = 0; i < part.length; i++) {
+        var ch = part[i], code = ch.charCodeAt(0);
+        if (code >= 0xAC00 && code <= 0xD7A3) {
+          out += stage >= 2 ? CHO[Math.floor((code - 0xAC00) / 588)] : '○';
+          runStart = true;
+        } else if (/[A-Za-z0-9]/.test(ch)) {
+          out += stage >= 2 && runStart ? ch : '○';
+          runStart = false;
+        } else {
+          out += ch;
+          runStart = true;
+        }
+      }
+      return out;
+    }).join('');
+  }
+
+  // ---------- 보기형 ----------
+  var CIRCLED = ['①', '②', '③', '④', '⑤'];
+  /** 보기 목록 정리: 글자만, 앞뒤 공백 제거, 빈 것 제외. 2~5개가 아니면 null */
+  function normalizeChoices(arr) {
+    if (!Array.isArray(arr)) return null;
+    var out = arr.filter(function (c) { return typeof c === 'string' || typeof c === 'number'; })
+      .map(function (c) { return String(c).trim(); }).filter(Boolean);
+    return out.length >= 2 && out.length <= 5 ? out : null;
+  }
+  function squash(s) { return String(s).replace(/\s+/g, '').toLowerCase(); }
+  /** 정답이 가리키는 보기 번호(0부터). 공백·대소문자 무시 비교, 또는 "①"/"1" 같은 번호. 없으면 -1 */
+  function choiceIndex(choices, a) {
+    if (!Array.isArray(choices) || !choices.length) return -1;
+    var key = squash(a === undefined || a === null ? '' : a);
+    if (!key) return -1;
+    for (var i = 0; i < choices.length; i++) if (squash(choices[i]) === key) return i;
+    var ci = CIRCLED.indexOf(key);
+    if (ci !== -1 && ci < choices.length) return ci;
+    if (/^[1-5]$/.test(key) && Number(key) <= choices.length) return Number(key) - 1;
+    return -1;
+  }
+
+  // ---------- 반별 기록 ----------
+  var RECORD_MAX = 100;
+  /** 끝난 판의 기록 한 줄 */
+  function buildRecord(g, setTitles, now) {
+    var ranked = rankScores(computeScores(g.cells, g.cols, g.rows, g.teams.length));
+    var log = g.log || [];
+    var ok = log.filter(function (r) { return r.result === 'correct' || r.result === 'steal-ok'; }).length;
+    return {
+      id: g.gameId,
+      date: (now || new Date()).toISOString(),
+      className: g.className || '',
+      sets: (setTitles || []).slice(),
+      questions: log.length,
+      correctRate: log.length ? Math.round(ok / log.length * 100) : 0,
+      teams: ranked.map(function (s) {
+        return { name: g.teams[s.team].name, rank: s.rank, score: s.total, cells: s.cells, largest: s.largest };
+      })
+    };
+  }
+  /** 같은 판(id)이면 갱신, 아니면 맨 앞에 추가. 최근 100판까지 */
+  function upsertRecord(list, rec) {
+    var out = (Array.isArray(list) ? list : []).filter(function (r) { return r && r.id !== rec.id; });
+    out.unshift(rec);
+    return out.slice(0, RECORD_MAX);
+  }
+  function csvCell(v) {
+    var s = String(v === undefined || v === null ? '' : v);
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  /** 엑셀용 CSV(UTF-8 BOM). 조마다 한 줄 */
+  function recordsToCSV(list) {
+    var rows = [['날짜', '반', '세트', '문제 수', '정답률(%)', '순위', '조', '점수', '칸 수', '최대 연결']];
+    (list || []).forEach(function (r) {
+      var d = new Date(r.date);
+      var ds = isNaN(d) ? r.date : d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2) +
+        ' ' + ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+      (r.teams || []).forEach(function (t) {
+        rows.push([ds, r.className, (r.sets || []).join(' / '), r.questions, r.correctRate, t.rank, t.name, t.score, t.cells, t.largest]);
+      });
+    });
+    return '﻿' + rows.map(function (row) { return row.map(csvCell).join(','); }).join('\r\n') + '\r\n';
+  }
+
+  // ---------- 음량 ----------
+  var VOL_LEVELS = ['off', 'low', 'mid', 'high'];
+  var MUSIC_BASE = 0.2;
+  /** 음량 단계 → 배수. 음악: 0 / 0.5 / 1 / 2 배, 효과음: 0 / 0.5 / 1 / 1.6 배 */
+  function volumeScale(kind, level) {
+    var i = VOL_LEVELS.indexOf(level);
+    if (i <= 0) return 0;
+    return [0, 0.5, 1, kind === 'music' ? 2 : 1.6][i];
+  }
+  function nextVolume(level) { var i = VOL_LEVELS.indexOf(level); return VOL_LEVELS[(i + 1) % VOL_LEVELS.length]; }
+  /** 설정 저장본 변환: 예전 sound/music(true/false) → 보통/끔 */
+  function migratePrefs(p) {
+    var out = { sfx: 'mid', music: 'mid' };
+    if (!p || typeof p !== 'object') return out;
+    if (VOL_LEVELS.indexOf(p.sfx) !== -1) out.sfx = p.sfx;
+    else if (typeof p.sound === 'boolean') out.sfx = p.sound ? 'mid' : 'off';
+    if (VOL_LEVELS.indexOf(p.music) !== -1) out.music = p.music;
+    else if (typeof p.music === 'boolean') out.music = p.music ? 'mid' : 'off';
+    return out;
   }
 
   /** 정답 처리: 칸 점령 + 특수 칸 발동. 발동 내용을 반환. team 을 주면 그 조가 차지(스틸) */
@@ -289,6 +450,9 @@
     info = info || {};
     var r = { idx: idx, team: team, result: result, key: info.key || '', q: info.q || '', a: info.a || '', note: info.note || '', hasImg: !!info.img };
     if (stealTeam !== undefined) r.stealTeam = stealTeam;
+    if (info.hint) r.hint = info.hint;            // 힌트 몇 단계까지 봤나(점수와 무관)
+    if (info.choices) r.choices = info.choices.slice();
+    if (info.students) r.students = info.students; // 추첨된 번호 { 조: 번호 }
     g.log.push(r);
   }
 
@@ -296,6 +460,7 @@
   function judge(g, idx, correct, rng, info) {
     normalizeGame(g);
     pushHistory(g);
+    applyDraws(g, info);
     var team = g.turn;
     var ev = correct ? applyCorrect(g, idx, rng) : { idx: idx, team: team, correct: false, special: null, effectIdx: -1, extraTurn: false };
     logRecord(g, idx, team, correct ? 'correct' : 'wrong', info);
@@ -321,6 +486,7 @@
   function judgeSteal(g, idx, stealTeam, correct, rng, info) {
     normalizeGame(g);
     pushHistory(g);
+    applyDraws(g, info);
     var team = g.turn;
     g.steals[stealTeam] = false;
     var ev = correct ? applyCorrect(g, idx, rng, stealTeam)
@@ -386,6 +552,7 @@
     g.log = Array.isArray(s.log) ? s.log : [];
     g.turnsDone = Array.isArray(s.turnsDone) ? s.turnsDone : fillArr(n, 0);
     g.extra = !!s.extra;
+    if (Array.isArray(s.bags) && g.draw) g.draw.bags = s.bags;
     // 시간제에서 시간이 다 된 뒤 되돌리면 다시 끝나지 않도록 종료 상태만 다시 계산하지 않는다(교사 판단에 맡김)
     return true;
   }
@@ -404,7 +571,11 @@
     createGame: createGame, applyCorrect: applyCorrect, judge: judge, undo: undo, isValidSave: isValidSave,
     LENGTHS: LENGTHS, sanitizeImg: sanitizeImg, normalizeGame: normalizeGame, stealCandidates: stealCandidates,
     judgeSteal: judgeSteal, tickClock: tickClock, isTimeUp: isTimeUp, turnsComplete: turnsComplete,
-    roundInfo: roundInfo, checkEnd: checkEnd, reviewList: reviewList, snapshot: snapshot
+    roundInfo: roundInfo, checkEnd: checkEnd, reviewList: reviewList, snapshot: snapshot,
+    drawStudent: drawStudent, clampDrawSize: clampDrawSize, DRAW_MIN: DRAW_MIN, DRAW_MAX: DRAW_MAX, DRAW_DEFAULT: DRAW_DEFAULT, LOOK_COUNT: LOOK_COUNT,
+    hintText: hintText, normalizeChoices: normalizeChoices, choiceIndex: choiceIndex, CIRCLED: CIRCLED,
+    buildRecord: buildRecord, upsertRecord: upsertRecord, recordsToCSV: recordsToCSV, RECORD_MAX: RECORD_MAX,
+    VOL_LEVELS: VOL_LEVELS, MUSIC_BASE: MUSIC_BASE, volumeScale: volumeScale, nextVolume: nextVolume, migratePrefs: migratePrefs
   };
   root.TTLogic = Logic;
   if (typeof module === 'object' && module && module.exports) module.exports = Logic;
@@ -437,8 +608,10 @@
   // { idx, kind, question, revealed, timerId, endAt, expired, lastTick, phase: ask|pick|steal, stealTeam }
   var modal = null;
   var busy = false;          // 특수 칸·스틸 연출 중
-  var prefs = { sound: true, music: true };
-  var setup = { teamCount: 4, names: [], setIds: [], sizeKey: 'm', timeLimit: 0, steal: true, length: 'none' };
+  var prefs = { sfx: 'mid', music: 'mid' };   // 음량 단계: off / low / mid / high
+  var setup = { teamCount: 4, names: [], setIds: [], sizeKey: 'm', timeLimit: 0, steal: true, length: 'none',
+    hint: true, draw: false, drawSizes: [], className: '', looks: [], tab: 'basic' };
+  var RECORDS_KEY = 'ttang-battle-records-v1';
   var review = null;         // { all, list, i, revealed }
   var setupChars = [];       // 설정 화면 캐릭터(조별 1명, 재사용)
   var heroChars = [];        // 게임 화면 보드 옆 캐릭터(조별 1명, 현재 조만 보임)
@@ -457,11 +630,20 @@
   function loadSave() { var s = storageGet(STORAGE_KEY); return Logic.isValidSave(s) ? s : null; }
 
   // ---------- 효과음 (오실레이터 단순 음) ----------
-  var actx = null;
+  // 효과음 출력: 음 → sfxOut(음량 단계 배수) → 압축기(겹쳐도 찢어지지 않게) → 스피커
+  var actx = null, sfxOut = null;
   function audio() {
-    if (!prefs.sound) return null;
+    if (Logic.volumeScale('sfx', prefs.sfx) <= 0) return null;
     try {
-      if (!actx) { var AC = root.AudioContext || root.webkitAudioContext; if (!AC) return null; actx = new AC(); }
+      if (!actx) {
+        var AC = root.AudioContext || root.webkitAudioContext; if (!AC) return null;
+        actx = new AC();
+        sfxOut = actx.createGain();
+        var comp = actx.createDynamicsCompressor();
+        comp.threshold.value = -10; comp.knee.value = 8; comp.ratio.value = 8; comp.attack.value = 0.003; comp.release.value = 0.15;
+        sfxOut.connect(comp); comp.connect(actx.destination);
+      }
+      sfxOut.gain.value = Logic.volumeScale('sfx', prefs.sfx);
       if (actx.state === 'suspended') actx.resume();
       return actx;
     } catch (e) { return null; }
@@ -472,9 +654,9 @@
     var o = ctx.createOscillator(), gn = ctx.createGain();
     o.type = type || 'sine'; o.frequency.setValueAtTime(freq, t0);
     gn.gain.setValueAtTime(0.0001, t0);
-    gn.gain.exponentialRampToValueAtTime((vol || 0.18) * 2, t0 + 0.02); // 전체 2배: 교실 TV에서 들리게
+    gn.gain.exponentialRampToValueAtTime((vol || 0.18) * 2, t0 + 0.02); // 전체 2배: 교실 TV에서 들리게(보통 단계 기준)
     gn.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-    o.connect(gn); gn.connect(ctx.destination);
+    o.connect(gn); gn.connect(sfxOut);
     o.start(t0); o.stop(t0 + dur + 0.05);
   }
   var SFX = {
@@ -521,7 +703,12 @@
   }
   function teamName(t) { return g.teams[t].name; }
   function icon(name) { return V.tex.icon(name); }
-  function headIcon(t, px, face) { return V.headIcon(t, TEAM_COLORS[t].bg, px, face); }
+  /** 조 t 의 머리 아이콘(게임 중이면 그 판의 캐릭터 모양, 아니면 설정의 모양) */
+  function lookOf(t) {
+    if (g && g.looks && typeof g.looks[t] === 'number') return g.looks[t];
+    return typeof setup.looks[t] === 'number' ? setup.looks[t] : t % Logic.LOOK_COUNT;
+  }
+  function headIcon(t, px, face) { return V.headIcon(t, TEAM_COLORS[t].bg, px, face, lookOf(t)); }
   function vh(n) { return root.innerHeight * n / 100; }
 
   /** 외곽선 변수, 돌 버튼, 구름, 잔디 바닥 등 텍스처를 CSS에 넣는다 */
@@ -564,9 +751,22 @@
   }
   function editorOpen() { return !!(root.TTEditor && root.TTEditor.isOpen()); }
 
+  function setupLook(t) { return typeof setup.looks[t] === 'number' ? setup.looks[t] : t % Logic.LOOK_COUNT; }
   function setupChar(t) {
-    if (!setupChars[t]) setupChars[t] = V.create({ team: t, outfit: TEAM_COLORS[t].bg, size: 150 });
+    var look = setupLook(t);
+    if (setupChars[t] && setupChars[t].look !== look) { setupChars[t].destroy(); setupChars[t] = null; }
+    if (!setupChars[t]) setupChars[t] = V.create({ team: t, outfit: TEAM_COLORS[t].bg, size: 150, look: look });
     return setupChars[t];
+  }
+  /** 설정 화면 캐릭터를 누르면 그 조의 모양이 다음 것으로(8종 순환, 조 색은 그대로) */
+  function cycleLook(t) {
+    for (var i = 0; i < setup.teamCount; i++) if (typeof setup.looks[i] !== 'number') setup.looks[i] = setupLook(i);
+    setup.looks[t] = (setupLook(t) + 1) % Logic.LOOK_COUNT;
+    saveSetupPrefs();
+    renderSetupChars();
+    setupChars[t].setFace('happy').play('cheer');
+    sfx('click');
+    setTimeout(function () { if (setupChars[t]) setupChars[t].setFace('normal').play('idle'); }, 800);
   }
 
   function renderSetupChars() {
@@ -579,6 +779,9 @@
       col.className = 'setup-char';
       var c = setupChar(t);
       c.setSize(size);
+      c.el.dataset.team = t;
+      c.el.classList.add('pickable');
+      c.el.title = '누르면 캐릭터 모양이 바뀝니다';
       col.appendChild(c.el);
       var row = document.createElement('label');
       row.className = 'name-row';
@@ -631,6 +834,19 @@
     Array.prototype.forEach.call(document.querySelectorAll('#length-opts .seg'), function (b) {
       b.classList.toggle('on', b.dataset.len === setup.length);
     });
+    Array.prototype.forEach.call(document.querySelectorAll('#hint-opts .seg'), function (b) {
+      b.classList.toggle('on', (b.dataset.hint === 'on') === setup.hint);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('#draw-opts .seg'), function (b) {
+      b.classList.toggle('on', (b.dataset.draw === 'on') === setup.draw);
+    });
+    renderDrawSizes();
+    Array.prototype.forEach.call(document.querySelectorAll('.opt-tab'), function (b) {
+      b.classList.toggle('on', b.dataset.tab === setup.tab);
+    });
+    show($('tab-basic'), setup.tab === 'basic');
+    show($('tab-adv'), setup.tab === 'adv');
+    if (document.activeElement !== $('class-name')) $('class-name').value = setup.className;
     var total = Logic.buildQuestionPool(sets, setup.setIds).length;
     $('setup-summary').textContent = setup.setIds.length ? '선택한 문제: ' + total + '문항' : '문제 세트를 하나 이상 고르세요';
     $('btn-start').disabled = total === 0;
@@ -673,6 +889,36 @@
       var b = e.target.closest('button'); if (!b) return;
       setup.length = b.dataset.len; renderSetup();
     });
+    $('hint-opts').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      setup.hint = b.dataset.hint === 'on'; saveSetupPrefs(); renderSetup();
+    });
+    $('draw-opts').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      setup.draw = b.dataset.draw === 'on'; saveSetupPrefs(); renderSetup();
+    });
+    $('draw-all').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      var n = Number(b.dataset.n);
+      for (var t = 0; t < 6; t++) setup.drawSizes[t] = n;
+      saveSetupPrefs(); renderSetup();
+    });
+    $('draw-each').addEventListener('change', function (e) {
+      var t = Number(e.target.dataset.t);
+      if (isNaN(t)) return;
+      setup.drawSizes[t] = Logic.clampDrawSize(e.target.value);
+      e.target.value = setup.drawSizes[t];
+      saveSetupPrefs(); renderSetup();
+    });
+    $('class-name').addEventListener('input', function (e) { setup.className = e.target.value.slice(0, 20); saveSetupPrefs(); });
+    document.querySelector('.opt-tabs').addEventListener('click', function (e) {
+      var b = e.target.closest('.opt-tab'); if (!b) return;
+      setup.tab = b.dataset.tab; renderSetup();
+    });
+    $('setup-chars').addEventListener('click', function (e) {
+      var v = e.target.closest('.vx.pickable'); if (!v) return;
+      cycleLook(Number(v.dataset.team));
+    });
     $('btn-start').addEventListener('click', startNewGame);
     $('btn-resume').addEventListener('click', resumeGame);
   }
@@ -685,10 +931,57 @@
     }
     pool = Logic.buildQuestionPool(allSets(), setup.setIds);
     if (!pool.length) { toast('문제 세트를 고르세요'); return; }
+    var looks = [], sizes = [];
+    for (var k = 0; k < setup.teamCount; k++) { looks.push(setupLook(k)); sizes.push(drawSize(k)); }
     g = Logic.createGame({ teamNames: names, setIds: setup.setIds, sizeKey: setup.sizeKey, timeLimit: setup.timeLimit,
-      steal: setup.steal, length: setup.length });
+      steal: setup.steal, length: setup.length, hint: setup.hint, draw: setup.draw, drawSizes: sizes,
+      className: setup.className, looks: looks });
     saveGame();
     enterGame();
+  }
+
+  function drawSize(t) { return Logic.clampDrawSize(setup.drawSizes[t] === undefined ? Logic.DRAW_DEFAULT : setup.drawSizes[t]); }
+  /** 조 인원: [전체 같게] 2~8 버튼 + 조별 칸(조별로 다르게) */
+  function renderDrawSizes() {
+    show($('draw-size-row'), setup.draw);
+    if (!setup.draw) return;
+    var all = $('draw-all');
+    var same = true, first = drawSize(0);
+    for (var t = 1; t < setup.teamCount; t++) if (drawSize(t) !== first) same = false;
+    all.textContent = '';
+    for (var n = Logic.DRAW_MIN; n <= Logic.DRAW_MAX; n++) {
+      var b = document.createElement('button');
+      b.type = 'button'; b.className = 'seg' + (same && n === first ? ' on' : ''); b.dataset.n = n; b.textContent = n;
+      b.title = '모든 조 ' + n + '명';
+      all.appendChild(b);
+    }
+    all.appendChild(span('dim draw-unit', '명(모든 조)'));
+    var each = $('draw-each');
+    each.textContent = '';
+    for (var t2 = 0; t2 < setup.teamCount; t2++) {
+      var lab = document.createElement('label');
+      lab.className = 'draw-one';
+      lab.insertAdjacentHTML('beforeend', teamChip(t2));
+      var inp = document.createElement('input');
+      inp.type = 'number'; inp.min = Logic.DRAW_MIN; inp.max = Logic.DRAW_MAX; inp.value = drawSize(t2);
+      inp.dataset.t = t2; inp.setAttribute('aria-label', (t2 + 1) + '조 인원');
+      lab.appendChild(inp);
+      each.appendChild(lab);
+    }
+  }
+  /** 설정 화면 선택(힌트·추첨·인원·반 이름·캐릭터)은 다음에 열어도 남게 저장 */
+  var SETUP_KEY = 'ttang-battle-setup-v1';
+  function saveSetupPrefs() {
+    storageSet(SETUP_KEY, { hint: setup.hint, draw: setup.draw, drawSizes: setup.drawSizes, className: setup.className, looks: setup.looks });
+  }
+  function loadSetupPrefs() {
+    var s = storageGet(SETUP_KEY);
+    if (!s || typeof s !== 'object') return;
+    if (typeof s.hint === 'boolean') setup.hint = s.hint;
+    if (typeof s.draw === 'boolean') setup.draw = s.draw;
+    if (Array.isArray(s.drawSizes)) setup.drawSizes = s.drawSizes.map(Logic.clampDrawSize);
+    if (typeof s.className === 'string') setup.className = s.className.slice(0, 20);
+    if (Array.isArray(s.looks)) setup.looks = s.looks.map(function (v, i) { v = Math.floor(Number(v)); return v >= 0 && v < Logic.LOOK_COUNT ? v : i % Logic.LOOK_COUNT; });
   }
 
   function resumeGame() {
@@ -729,6 +1022,11 @@
       setup.setIds = g.setIds.filter(function (id) { return allSets().some(function (s) { return s.id === id; }); });
       setup.sizeKey = g.sizeKey; setup.timeLimit = g.timeLimit;
       setup.steal = g.stealOn !== false; setup.length = g.length || 'none';
+      setup.hint = g.hintOn !== false; setup.className = g.className || '';
+      setup.looks = g.looks.slice();
+      setup.draw = !!(g.draw && g.draw.on);
+      if (g.draw && g.draw.sizes) setup.drawSizes = g.draw.sizes.slice();
+      saveSetupPrefs();
     }
     renderSetupChars();
     renderSetup();
@@ -741,7 +1039,7 @@
     stage.innerHTML = '';
     heroChars = [];
     for (var t = 0; t < g.teams.length; t++) {
-      var c = V.create({ team: t, outfit: TEAM_COLORS[t].bg, size: 300 });
+      var c = V.create({ team: t, outfit: TEAM_COLORS[t].bg, size: 300, look: lookOf(t) });
       c.el.classList.add('hidden');
       stage.appendChild(c.el);
       heroChars.push(c);
@@ -893,8 +1191,7 @@
     }
     $('empty-left').textContent = '남은 빈 땅 ' + Logic.emptyCount(g.cells) + '칸';
     $('btn-undo').disabled = !g.history.length;
-    $('btn-sound').textContent = prefs.sound ? '효과음 켬' : '효과음 끔';
-    $('btn-music').textContent = prefs.music ? '음악 켬' : '음악 끔';
+    renderVolButtons();
     renderClock();
   }
 
@@ -968,11 +1265,14 @@
     if (r.reset) g.used = [];
     g.used.push(r.question.key);
     stopTimer();
+    var keepDraws = modal && excludeKey ? modal.draws : null; // [문제 바꾸기]는 뽑힌 학생 그대로
     modal = { idx: idx, kind: kind, question: r.question, revealed: false, expired: false, timerId: null, endAt: 0, lastTick: -1,
-      phase: 'ask', stealTeam: -1 };
+      phase: 'ask', stealTeam: -1, hint: 0, draws: keepDraws || {} };
     showHero(g.turn, kind === 'attack' ? 'point' : 'idle', 'normal');
+    if (g.draw.on && !modal.draws[g.turn]) doDraw(g.turn);
     renderModal();
     show($('qmodal'), true);
+    fitModal(); // 보이는 상태에서 다시 재야 넘침을 알 수 있다
     sfx('click');
     musicHurry(false);
     music('tense');
@@ -1007,13 +1307,23 @@
     head.appendChild(lv);
     var qt = $('q-text');
     qt.textContent = q.q;
-    qt.className = 'q-text ' + fitQuestionClass(q.q) + (q.img ? ' with-img' : '');
+    qt.className = 'q-text ' + fitQuestionClass(q.q) + (q.img ? ' with-img' : '') + (q.choices ? ' with-choices' : '');
     renderQuestionImage(q.img);
+    renderChoices(q, m.revealed);
     $('a-text').textContent = q.a;
     $('a-note').textContent = q.note || '';
     show($('a-note'), !!q.note);
     show($('answer'), m.revealed);
     $('btn-reveal').disabled = m.revealed;
+    // 힌트: 보기형 문제·힌트 끔이면 숨김, 정답 공개 뒤·2단계 다 쓰면 비활성
+    var hintable = g.hintOn && !q.choices;
+    show($('btn-hint'), hintable);
+    $('btn-hint').disabled = m.revealed || m.hint >= 2;
+    $('btn-hint').firstChild.textContent = m.hint ? '힌트 ' + Math.min(m.hint + 1, 2) + '단계 ' : '힌트 ';
+    var hEl = $('q-hint');
+    show(hEl, hintable && m.hint > 0 && !m.revealed);
+    if (m.hint > 0) hEl.textContent = (m.hint === 1 ? '글자 수  ' : '초성  ') + Logic.hintText(q.a, m.hint);
+    renderDraw();
     // 스틸 조 고르기 단계: 판정 버튼 대신 조 버튼
     var picking = m.phase === 'pick';
     show($('steal-panel'), picking);
@@ -1024,6 +1334,83 @@
     if (picking) renderStealPanel();
     buildTimerBar();
     renderTimer();
+    fitModal();
+  }
+
+  /** 보기: ①~⑤ 큰 칸. 2개면 좌우 두 칸. 정답 공개 시 정답 보기 강조 */
+  function renderChoices(q, revealed) {
+    var host = $('q-choices');
+    host.textContent = '';
+    show(host, !!q.choices);
+    $('qbox').classList.toggle('has-choices', !!q.choices);
+    if (!q.choices) return;
+    host.className = 'q-choices n' + q.choices.length + (revealed ? ' revealed' : '');
+    var right = Logic.choiceIndex(q.choices, q.a);
+    q.choices.forEach(function (c, i) {
+      var d = document.createElement('div');
+      d.className = 'q-choice' + (revealed && i === right ? ' correct' : '');
+      d.appendChild(span('q-choice-no', Logic.CIRCLED[i]));
+      d.appendChild(span('q-choice-text', c));
+      host.appendChild(d);
+    });
+  }
+
+  /** 글자·그림·보기·스틸 버튼이 함께 있어도 한 화면에: 넘치면 단계적으로 줄인다 */
+  function fitModal() {
+    if ($('qmodal').classList.contains('hidden')) return;
+    var box = $('qbox'), body = box.querySelector('.q-body');
+    box.classList.remove('tight1', 'tight2', 'tight3');
+    var over = function () { return body.scrollHeight > body.clientHeight + 2 || box.scrollHeight > box.clientHeight + 2; };
+    ['tight1', 'tight2', 'tight3'].forEach(function (c) { if (over()) box.classList.add(c); });
+  }
+
+  // ---------- 힌트 ----------
+  function useHint() {
+    if (!modal || modal.phase === 'pick' || modal.revealed || !g.hintOn || modal.question.choices) return;
+    if (modal.hint >= 2) return;
+    modal.hint++;
+    sfx('click');
+    renderModal();
+  }
+
+  // ---------- 답할 학생 추첨 ----------
+  var lastDrawn = {};          // 조별 직전 번호(가방을 새로 채울 때 같은 번호가 바로 이어 나오지 않게)
+  var drawAnim = null, drawSpinning = false;
+  /** t조 번호 뽑기(가방 상태는 판정 때 반영 — 닫기(Esc)만 하면 뽑기도 없던 일) + 룰렛 연출 */
+  function doDraw(t) {
+    var r = Logic.drawStudent(g.draw.bags[t], g.draw.sizes[t], Math.random, lastDrawn[t]);
+    modal.draws[t] = r;
+    lastDrawn[t] = r.num;
+    spinDraw(t);
+  }
+  function drawTeam() { return modal && modal.phase === 'steal' ? modal.stealTeam : g.turn; }
+  function renderDraw() {
+    var el = $('q-draw');
+    var t = modal ? drawTeam() : -1;
+    var d = modal && modal.draws[t];
+    show(el, !!(g && g.draw.on && d && modal.phase !== 'pick'));
+    if (!d || drawSpinning) return;
+    el.textContent = teamName(t) + ' ' + d.num + '번';
+  }
+  function spinDraw(t) {
+    clearInterval(drawAnim);
+    var el = $('q-draw'), n = g.draw.sizes[t], final = modal.draws[t].num, t0 = Date.now();
+    show(el, true);
+    el.classList.remove('done');
+    if (V.reduceMotion) { drawSpinning = false; el.textContent = teamName(t) + ' ' + final + '번'; el.classList.add('done'); return; }
+    drawSpinning = true;
+    drawAnim = setInterval(function () {
+      if (!modal) { clearInterval(drawAnim); drawSpinning = false; return; }
+      if (Date.now() - t0 >= 800) {
+        clearInterval(drawAnim);
+        drawSpinning = false;
+        el.textContent = teamName(t) + ' ' + final + '번';
+        el.classList.add('done');
+        sfx('click');
+        return;
+      }
+      el.textContent = teamName(t) + ' ' + (1 + Math.floor(Math.random() * n)) + '번';
+    }, 60);
   }
 
   /** 문제 그림: 검증된 주소만 img.src 로. 못 불러오면 안내 글 */
@@ -1034,7 +1421,8 @@
     $('qbox').classList.toggle('has-img', !!src);
     if (!src) { im.removeAttribute('src'); return; }
     show(err, false); show(im, true);
-    im.onerror = function () { show(im, false); show(err, true); };
+    im.onerror = function () { show(im, false); show(err, true); fitModal(); };
+    im.onload = function () { fitModal(); };
     if (im.getAttribute('src') !== src) im.src = src;
   }
   function openLightbox(src) {
@@ -1067,6 +1455,7 @@
     modal.expired = false; modal.lastTick = -1;
     sfx('click');
     showHero(t, 'point', 'normal');
+    if (g.draw.on) doDraw(t); // 스틸 조에서도 다시 추첨
     renderModal();
     renderScores();
     musicHurry(false);
@@ -1136,6 +1525,7 @@
 
   function closeModal() {
     stopTimer();
+    clearInterval(drawAnim); drawSpinning = false;
     modal = null;
     show($('qmodal'), false);
     closeLightbox();
@@ -1165,11 +1555,22 @@
     commitJudge(correct, false);
   }
 
-  function questionInfo(q) { return { key: q.key, q: q.q, a: q.a, note: q.note, img: q.img }; }
+  /** 판정 기록용 정보: 문제 + 힌트 단계 + 추첨(가방 상태는 판정과 함께 저장·되돌리기) */
+  function questionInfo(m) {
+    var q = m.question;
+    var info = { key: q.key, q: q.q, a: q.a, note: q.note, img: q.img, hint: m.hint || 0, choices: q.choices || null };
+    var teams = Object.keys(m.draws || {});
+    if (teams.length) {
+      info.bags = {}; info.students = {};
+      teams.forEach(function (t) { info.bags[t] = m.draws[t].bag; info.students[t] = m.draws[t].num; });
+    }
+    return info;
+  }
 
   /** 판정을 상태에 반영(한 번의 되돌리기 단위). steal=true 면 원래 조 오답 + 스틸 조 판정 */
   function commitJudge(correct, steal) {
-    var m = modal, idx = m.idx, info = questionInfo(m.question);
+    var m = modal, idx = m.idx, info = questionInfo(m);
+    clearInterval(drawAnim);
     stopTimer();
     modal = null;
     show($('qmodal'), false);
@@ -1248,9 +1649,88 @@
     $('podium').innerHTML = '';
   }
 
+  // ---------- 반별 기록 ----------
+  function loadRecords() { var r = storageGet(RECORDS_KEY); return Array.isArray(r) ? r : []; }
+  /** 끝난 판 기록 저장(같은 판이면 갱신) */
+  function saveRecord() {
+    if (!g || !g.ended || !g.log.length) return;
+    var titles = allSets().filter(function (s) { return g.setIds.indexOf(s.id) !== -1; }).map(function (s) { return s.title || s.id; });
+    storageSet(RECORDS_KEY, Logic.upsertRecord(loadRecords(), Logic.buildRecord(g, titles)));
+  }
+  var recFilter = '';
+  function openRecords() { recFilter = ''; renderRecords(); show($('records'), true); }
+  function closeRecords() { show($('records'), false); }
+  function fmtDate(iso) {
+    var d = new Date(iso);
+    if (isNaN(d)) return String(iso || '');
+    return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+  }
+  function renderRecords() {
+    var all = loadRecords();
+    var names = [];
+    all.forEach(function (r) { var c = r.className || ''; if (names.indexOf(c) === -1) names.push(c); });
+    var sel = $('rec-class');
+    sel.textContent = '';
+    var optAll = document.createElement('option'); optAll.value = '\u0000all'; optAll.textContent = '전체';
+    sel.appendChild(optAll);
+    names.sort().forEach(function (c) {
+      var o = document.createElement('option'); o.value = c; o.textContent = c || '(반 이름 없음)';
+      sel.appendChild(o);
+    });
+    sel.value = recFilter === '' ? '\u0000all' : recFilter;
+    var list = recFilter === '' ? all : all.filter(function (r) { return (r.className || '') === recFilter; });
+    $('rec-count').textContent = list.length + '판';
+    var host = $('rec-rows');
+    host.textContent = '';
+    if (!list.length) {
+      var e = document.createElement('div'); e.className = 'ed-empty'; e.textContent = '저장된 기록이 없습니다. 판이 끝나면 자동으로 저장됩니다.';
+      host.appendChild(e);
+    }
+    list.forEach(function (r) {
+      var row = document.createElement('div'); row.className = 'rec-row';
+      var top = (r.teams || [])[0] || {};
+      var cells = [fmtDate(r.date), r.className || '-', (r.sets || []).join(', '), (top.name || '') + ' ' + (top.score !== undefined ? top.score + '점' : ''),
+        (r.questions || 0) + '문제', (r.correctRate || 0) + '%',
+        (r.teams || []).map(function (t) { return t.rank + '위 ' + t.name + ' ' + t.score; }).join(' · ')];
+      cells.forEach(function (txt, i) { var d = document.createElement('div'); d.className = 'rec-c rec-c' + i; d.textContent = txt; d.title = txt; row.appendChild(d); });
+      var del = document.createElement('button'); del.type = 'button'; del.className = 'ed-act ed-act-del'; del.textContent = '✕';
+      del.title = '이 기록 삭제'; del.dataset.id = r.id;
+      var dc = document.createElement('div'); dc.appendChild(del); row.appendChild(dc);
+      host.appendChild(row);
+    });
+    $('rec-csv').disabled = !list.length;
+    $('rec-clear').disabled = !all.length;
+  }
+  function deleteRecord(id) {
+    storageSet(RECORDS_KEY, loadRecords().filter(function (r) { return r.id !== id; }));
+    renderRecords();
+  }
+  function clearRecords() {
+    if (!root.confirm('기록을 모두 지울까요? 지운 기록은 되살릴 수 없습니다.')) return;
+    storageSet(RECORDS_KEY, []);
+    renderRecords();
+  }
+  function exportRecordsCSV() {
+    var all = loadRecords();
+    var list = recFilter === '' ? all : all.filter(function (r) { return (r.className || '') === recFilter; });
+    if (!list.length) return;
+    var d = new Date();
+    var name = '땅따먹기-기록' + (recFilter ? '-' + recFilter.replace(/[\\/:*?"<>|\s]+/g, '_') : '') + '-' +
+      d.getFullYear() + ('0' + (d.getMonth() + 1)).slice(-2) + ('0' + d.getDate()).slice(-2) + '.csv';
+    try {
+      var blob = new Blob([Logic.recordsToCSV(list)], { type: 'text/csv;charset=utf-8' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a'); a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      toast(name + ' 파일로 내보냈습니다');
+    } catch (e) { toast('내보내기에 실패했습니다'); }
+  }
+
   function showResults(withSound) {
     closeModal();
     clearPodium();
+    saveRecord();
     var ranked = Logic.rankScores(Logic.computeScores(g.cells, g.cols, g.rows, g.teams.length));
     var html = '';
     ranked.forEach(function (s) {
@@ -1337,7 +1817,7 @@
       var s = top[i];
       var col = document.createElement('div');
       col.className = 'pod';
-      var c = V.create({ team: s.team, outfit: TEAM_COLORS[s.team].bg, size: charPx });
+      var c = V.create({ team: s.team, outfit: TEAM_COLORS[s.team].bg, size: charPx, look: lookOf(s.team) });
       if (s.rank === 1) c.setFace('happy').play('cheer');
       else c.setFace(i === 1 ? 'happy' : 'normal').play('idle');
       podiumChars.push(c);
@@ -1387,20 +1867,34 @@
     } catch (e) { /* 무시 */ }
   }
 
-  function toggleSound() {
-    prefs.sound = !prefs.sound;
-    storageSet(PREF_KEY, prefs);
-    if (g) renderTopbar();
-    if (prefs.sound) sfx('click');
+  // ---------- 음량(효과음·음악 각각 끔/작게/보통/크게) ----------
+  var VOL_NAMES = { off: '끔', low: '작게', mid: '보통', high: '크게' };
+  function applyMusicVolume() {
+    if (root.TTMusic) root.TTMusic.setVolume(Logic.MUSIC_BASE * Logic.volumeScale('music', prefs.music));
   }
-
-  function toggleMusic() {
-    prefs.music = !prefs.music;
+  /** 버튼 = 픽셀 스피커(음악은 음표) 아이콘 + 막대 0~3칸 + 이름 */
+  function renderVolButtons() {
+    Array.prototype.forEach.call(document.querySelectorAll('.vol-btn'), function (b) {
+      var kind = b.dataset.kind, level = prefs[kind], n = Logic.VOL_LEVELS.indexOf(level);
+      b.textContent = '';
+      var ic = document.createElement('i'); ic.className = 'vol-ic'; ic.style.backgroundImage = icon(kind === 'music' ? 'note' : 'speaker');
+      b.appendChild(ic);
+      var bars = document.createElement('span'); bars.className = 'vol-bars';
+      for (var k = 1; k <= 3; k++) { var bar = document.createElement('i'); bar.className = k <= n ? 'on' : ''; bars.appendChild(bar); }
+      b.appendChild(bars);
+      b.appendChild(span('vol-name', (kind === 'music' ? '음악 ' : '효과음 ') + VOL_NAMES[level]));
+      b.title = (kind === 'music' ? '배경음악' : '효과음') + ' 음량: ' + VOL_NAMES[level] + ' (누를 때마다 끔→작게→보통→크게)';
+      b.setAttribute('aria-label', b.title);
+    });
+  }
+  // 확인용(읽기 전용): 효과음 단계·출력 게인
+  root.TTSfx = { state: function () { return { level: prefs.sfx, gain: sfxOut ? +sfxOut.gain.value.toFixed(3) : null, ctx: actx ? actx.state : 'none' }; } };
+  function cycleVolume(kind) {
+    prefs[kind] = Logic.nextVolume(prefs[kind]);
     storageSet(PREF_KEY, prefs);
-    if (root.TTMusic) root.TTMusic.setEnabled(prefs.music);
-    if (prefs.music) musicForScreen();
-    if (g) renderTopbar();
-    $('btn-music-setup').textContent = prefs.music ? '음악 켬' : '음악 끔';
+    if (kind === 'music') { applyMusicVolume(); if (prefs.music !== 'off') musicForScreen(); }
+    else sfx('correct'); // 바뀐 음량으로 확인용 짧은 음
+    renderVolButtons();
   }
 
   function onKey(e) {
@@ -1410,6 +1904,7 @@
     if (editorOpen()) return; // 문제 편집기에서는 게임 단축키를 쓰지 않는다
     var code = e.code;
     if (code === 'KeyF') { e.preventDefault(); toggleFullscreen(); return; }
+    if (!$('records').classList.contains('hidden')) { if (code === 'Escape') { e.preventDefault(); closeRecords(); } return; }
     if (lightboxOpen()) { if (code === 'Escape' || code === 'Space') { e.preventDefault(); closeLightbox(); } return; }
     if ($('game').classList.contains('hidden')) return;
     if (review) {
@@ -1430,6 +1925,7 @@
       else if (code === 'KeyO') { e.preventDefault(); decide(true); }
       else if (code === 'KeyX') { e.preventDefault(); decide(false); }
       else if (code === 'KeyN') { e.preventDefault(); changeQuestion(); }
+      else if (code === 'KeyH') { e.preventDefault(); useHint(); }
       else if (code === 'Escape') { e.preventDefault(); escModal(); }
       return;
     }
@@ -1438,24 +1934,57 @@
     else if (code === 'Space') { e.preventDefault(); }
   }
 
+  // ---------- 링크로 열었을 때 오프라인 사용(서비스 워커, http(s)에서만) ----------
+  function registerOffline() {
+    if (!/^https?:$/.test(root.location.protocol) || !('serviceWorker' in navigator)) return; // file:// 은 건너뜀
+    var link = document.createElement('link');
+    link.rel = 'manifest'; link.href = 'manifest.webmanifest';
+    document.head.appendChild(link);
+    navigator.serviceWorker.addEventListener('message', function (e) {
+      if (e.data && e.data.type === 'ttang-cached') checkOfflineReady();
+    });
+    navigator.serviceWorker.register('sw.js').then(function () { return navigator.serviceWorker.ready; })
+      .then(checkOfflineReady).catch(function () { /* 등록 실패해도 게임은 그대로 */ });
+  }
+  /** 캐시에 index.html 과 game.js 가 들어 있으면 "오프라인 준비됨" */
+  function checkOfflineReady() {
+    if (!root.caches) return;
+    root.caches.keys().then(function (keys) {
+      var k = keys.filter(function (x) { return x.indexOf('ttang-battle-') === 0; }).sort().pop();
+      if (!k) return null;
+      return root.caches.open(k).then(function (c) {
+        return Promise.all([c.match('index.html'), c.match('game.js')]);
+      });
+    }).then(function (hits) {
+      if (hits && hits[0] && hits[1]) {
+        var el = $('offline-status');
+        el.textContent = '오프라인 준비됨';
+        el.title = '인터넷이 끊겨도 이 주소로 다시 열 수 있습니다';
+        show(el, true);
+      }
+    }).catch(function () { /* 무시 */ });
+  }
+
   var resizeTimer = null;
   function onResize() {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(function () {
       layoutBoard();
       layoutHero();
+      fitModal();
       if (!$('setup').classList.contains('hidden')) renderSetupChars();
     }, 80);
   }
 
   function init() {
-    var p = storageGet(PREF_KEY);
-    if (p && typeof p.sound === 'boolean') prefs.sound = p.sound;
-    if (p && typeof p.music === 'boolean') prefs.music = p.music;
-    if (root.TTMusic) root.TTMusic.setEnabled(prefs.music);
+    prefs = Logic.migratePrefs(storageGet(PREF_KEY)); // 예전 sound/music(true/false) → 보통/끔
+    storageSet(PREF_KEY, prefs);
+    applyMusicVolume();
     music('calm'); // 첫 클릭·키 입력 뒤에 소리가 난다
-    $('btn-music-setup').textContent = prefs.music ? '음악 켬' : '음악 끔';
     initLook();
+    renderVolButtons();
+    loadSetupPrefs();
+    registerOffline();
     var sets = allSets();
     var firstPlayable = sets.filter(function (x) { return x.questions.length > 0; })[0];
     if (firstPlayable) setup.setIds = [firstPlayable.id];
@@ -1487,8 +2016,16 @@
     $('q-img').addEventListener('click', function () { if (modal) openLightbox(Logic.sanitizeImg(modal.question.img)); });
     $('rv-img').addEventListener('click', function () { openLightbox($('rv-img').getAttribute('src')); });
     $('lightbox').addEventListener('click', closeLightbox);
-    $('btn-music').addEventListener('click', toggleMusic);
-    $('btn-music-setup').addEventListener('click', toggleMusic);
+    Array.prototype.forEach.call(document.querySelectorAll('.vol-btn'), function (b) {
+      b.addEventListener('click', function () { cycleVolume(b.dataset.kind); });
+    });
+    $('btn-hint').addEventListener('click', useHint);
+    $('btn-records').addEventListener('click', openRecords);
+    $('rec-close').addEventListener('click', closeRecords);
+    $('rec-clear').addEventListener('click', clearRecords);
+    $('rec-csv').addEventListener('click', exportRecordsCSV);
+    $('rec-class').addEventListener('change', function (e) { recFilter = e.target.value === '\u0000all' ? '' : e.target.value; renderRecords(); });
+    $('rec-rows').addEventListener('click', function (e) { var b = e.target.closest('button[data-id]'); if (b) deleteRecord(b.dataset.id); });
     $('btn-pause').addEventListener('click', togglePause);
     $('btn-review').addEventListener('click', function () { openReview(false); });
     $('btn-review-all').addEventListener('click', function () { openReview(true); });
@@ -1499,7 +2036,6 @@
     $('rv-close').addEventListener('click', closeReview);
     setInterval(tickGameClock, 250);
     $('btn-undo').addEventListener('click', doUndo);
-    $('btn-sound').addEventListener('click', toggleSound);
     $('btn-full').addEventListener('click', toggleFullscreen);
     $('btn-full-setup').addEventListener('click', toggleFullscreen);
     $('btn-end').addEventListener('click', endGameByTeacher);
